@@ -9,27 +9,80 @@ const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-const SYSTEM_INSTRUCTION = [
-  "You are Engineer, a helpful personal voice assistant.",
-  "Keep replies short and conversational, like a real spoken response — usually 1-3 sentences unless the user clearly wants more detail.",
-  "Never use markdown, bullet points, or numbered lists in your replies, since they will be read aloud.",
-  "Match the language the user is using. If they write in English, reply in English. If they write in Kiswahili, reply in Kiswahili. If they mix English and Kiswahili (Sheng or everyday code-switching), reply naturally in that same mixed, conversational style — do not force pure formal Kiswahili unless the user is doing that themselves.",
-  "When walking someone through a multi-step task (like programming or debugging), give ONE step at a time, keep it short, then explicitly ask something like 'let me know once you've done that' before moving to the next step. Never dump several steps at once during a live call.",
-  "",
-  "You have two tools you can call:",
-  '1. manage_tasks(action: "add"|"list"|"complete"|"delete", title?: string, task_id?: string) — reads/writes the user\'s task list.',
-  "2. research_idea(idea: string) — runs a business-idea research brief.",
-  "When the user's request needs one of these, respond with ONLY strict JSON and nothing else, no markdown fences: ",
-  '{"tool_call": {"name": "manage_tasks", "arguments": {"action": "add", "title": "..."}}}',
-  "or",
-  '{"tool_call": {"name": "research_idea", "arguments": {"idea": "..."}}}',
-  "Otherwise just respond normally in plain conversational text.",
-].join(" ");
+const CONV_STORAGE_KEY = "jarvis_conversations";
+const MEMORY_STORAGE_KEY = "jarvis_memory";
 
 type Role = "user" | "model";
 interface Message {
   role: Role;
   text: string;
+}
+
+interface Conversation {
+  id: string;
+  title: string;
+  messages: Message[];
+  updatedAt: number;
+}
+
+function loadConversations(): Conversation[] {
+  try {
+    const raw = localStorage.getItem(CONV_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function loadMemory(): string[] {
+  try {
+    const raw = localStorage.getItem(MEMORY_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function makeId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function titleFromMessages(messages: Message[]): string {
+  const firstUser = messages.find((m) => m.role === "user");
+  if (!firstUser || !firstUser.text.trim()) return "New conversation";
+  const trimmed = firstUser.text.trim();
+  return trimmed.length > 40 ? trimmed.slice(0, 40) + "…" : trimmed;
+}
+
+function buildSystemInstruction(memoryFacts: string[]): string {
+  const lines = [
+    "You are Engineer, a helpful personal voice assistant.",
+    "Keep replies short and conversational, like a real spoken response — usually 1-3 sentences unless the user clearly wants more detail.",
+    "Never use markdown, bullet points, or numbered lists in your replies, since they will be read aloud.",
+    "Match the language the user is using. If they write in English, reply in English. If they write in Kiswahili, reply in Kiswahili. If they mix English and Kiswahili (Sheng or everyday code-switching), reply naturally in that same mixed, conversational style — do not force pure formal Kiswahili unless the user is doing that themselves.",
+    "When walking someone through a multi-step task (like programming or debugging), give ONE step at a time, keep it short, then explicitly ask something like 'let me know once you've done that' before moving to the next step. Never dump several steps at once during a live call.",
+    "",
+    "You have three tools you can call:",
+    '1. manage_tasks(action: "add"|"list"|"complete"|"delete", title?: string, task_id?: string) — reads/writes the user\'s task list.',
+    "2. research_idea(idea: string) — runs a business-idea research brief.",
+    "3. remember(fact: string) — saves a short, durable fact about the user (their name, preferences, ongoing projects, recurring context) so you can recall it in future conversations, even new ones. Call this whenever the user shares something worth remembering long-term. Do not call it for one-off details that only matter for this exchange.",
+    "When the user's request needs one of these, respond with ONLY strict JSON and nothing else, no markdown fences: ",
+    '{"tool_call": {"name": "manage_tasks", "arguments": {"action": "add", "title": "..."}}}',
+    "or",
+    '{"tool_call": {"name": "research_idea", "arguments": {"idea": "..."}}}',
+    "or",
+    '{"tool_call": {"name": "remember", "arguments": {"fact": "..."}}}',
+    "Otherwise just respond normally in plain conversational text.",
+  ];
+  if (memoryFacts.length > 0) {
+    lines.push(
+      "",
+      "Known facts about this user you already remember: " +
+        memoryFacts.join("; ") +
+        ".",
+    );
+  }
+  return lines.join(" ");
 }
 
 interface GeminiPart {
@@ -55,7 +108,7 @@ function extractFinalAnswer(json: GeminiResponse): string {
 
 // ---- Tool-call detection ----
 interface ToolCall {
-  name: "manage_tasks" | "research_idea";
+  name: "manage_tasks" | "research_idea" | "remember";
   arguments: Record<string, any>;
 }
 
@@ -126,13 +179,32 @@ async function researchIdea(args: Record<string, any>): Promise<string> {
   return `Noted your idea "${idea}". The research pipeline isn't wired up yet, so this is just a placeholder brief for now.`;
 }
 
+async function rememberFact(args: Record<string, any>): Promise<string> {
+  const { fact } = args;
+  if (!fact || !String(fact).trim()) return "No fact given to remember.";
+  const cleanFact = String(fact).trim();
+  const current = loadMemory();
+  if (current.includes(cleanFact)) return `Already remembered: ${cleanFact}`;
+  const updated = [...current, cleanFact];
+  try {
+    localStorage.setItem(MEMORY_STORAGE_KEY, JSON.stringify(updated));
+  } catch {
+    return `Noted for now, but couldn't save it permanently: ${cleanFact}`;
+  }
+  return `Got it, I'll remember: ${cleanFact}`;
+}
+
 async function runTool(call: ToolCall): Promise<string> {
   if (call.name === "manage_tasks") return manageTasks(call.arguments);
   if (call.name === "research_idea") return researchIdea(call.arguments);
+  if (call.name === "remember") return rememberFact(call.arguments);
   return "Unknown tool.";
 }
 
-async function askEngineer(history: Message[]): Promise<string> {
+async function askEngineer(
+  history: Message[],
+  memoryFacts: string[],
+): Promise<string> {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent`,
     {
@@ -142,7 +214,9 @@ async function askEngineer(history: Message[]): Promise<string> {
         "x-goog-api-key": GEMMA_API_KEY,
       },
       body: JSON.stringify({
-        system_instruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+        system_instruction: {
+          parts: [{ text: buildSystemInstruction(memoryFacts) }],
+        },
         contents: history.map((m) => ({
           role: m.role,
           parts: [{ text: m.text }],
@@ -270,8 +344,13 @@ async function prepareSpeech(text: string): Promise<HTMLAudioElement | null> {
 interface SpeechRecognitionResultLike {
   transcript: string;
 }
+interface SpeechRecognitionResultListLike {
+  length: number;
+  [index: number]: { isFinal: boolean; 0: SpeechRecognitionResultLike };
+}
 interface SpeechRecognitionEventLike extends Event {
-  results: { 0: { 0: SpeechRecognitionResultLike } }[];
+  resultIndex: number;
+  results: SpeechRecognitionResultListLike;
 }
 interface SpeechRecognitionLike extends EventTarget {
   lang: string;
@@ -353,7 +432,22 @@ function playAndWait(
 }
 
 function App() {
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [conversations, setConversations] = useState<Conversation[]>(() =>
+    loadConversations(),
+  );
+  const [currentConversationId, setCurrentConversationId] = useState<string>(
+    () => {
+      const convos = loadConversations();
+      return convos[0]?.id ?? makeId();
+    },
+  );
+  const [messages, setMessages] = useState<Message[]>(() => {
+    const convos = loadConversations();
+    return convos[0]?.messages ?? [];
+  });
+  const [memoryFacts, setMemoryFacts] = useState<string[]>(() => loadMemory());
+  const [showHistory, setShowHistory] = useState(false);
+
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [listening, setListening] = useState(false);
@@ -382,6 +476,81 @@ function App() {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Persist the current conversation's messages into the conversations list
+  // (and localStorage) any time they change. Empty brand-new chats aren't
+  // saved until they actually have content, so "New Chat" doesn't spam the
+  // sidebar with blank entries.
+  useEffect(() => {
+    setConversations((prev) => {
+      const idx = prev.findIndex((c) => c.id === currentConversationId);
+      if (idx === -1 && messages.length === 0) return prev;
+
+      const updatedConvo: Conversation = {
+        id: currentConversationId,
+        title: titleFromMessages(messages),
+        messages,
+        updatedAt: Date.now(),
+      };
+
+      const next =
+        idx === -1
+          ? [updatedConvo, ...prev]
+          : prev.map((c, i) => (i === idx ? updatedConvo : c));
+
+      next.sort((a, b) => b.updatedAt - a.updatedAt);
+
+      try {
+        localStorage.setItem(CONV_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // storage full or unavailable — non-fatal
+      }
+
+      return next;
+    });
+  }, [messages, currentConversationId]);
+
+  function startNewConversation() {
+    setCurrentConversationId(makeId());
+    setMessages([]);
+    setShowHistory(false);
+  }
+
+  function selectConversation(id: string) {
+    const convo = conversations.find((c) => c.id === id);
+    if (!convo) return;
+    setCurrentConversationId(id);
+    setMessages(convo.messages);
+    setShowHistory(false);
+  }
+
+  function deleteConversation(id: string, e: React.MouseEvent) {
+    e.stopPropagation();
+    setConversations((prev) => {
+      const next = prev.filter((c) => c.id !== id);
+      try {
+        localStorage.setItem(CONV_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // non-fatal
+      }
+      return next;
+    });
+    if (id === currentConversationId) {
+      startNewConversation();
+    }
+  }
+
+  function forgetFact(index: number) {
+    setMemoryFacts((prev) => {
+      const next = prev.filter((_, i) => i !== index);
+      try {
+        localStorage.setItem(MEMORY_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // non-fatal
+      }
+      return next;
+    });
+  }
+
   async function sendMessage(text: string) {
     const trimmed = text.trim();
     if (!trimmed || loading) return;
@@ -395,11 +564,20 @@ function App() {
     setLoading(true);
     setPhase("thinking");
 
-    let reply = await askEngineer(nextMessages);
+    let reply = await askEngineer(nextMessages, memoryFacts);
     const toolCall = tryParseToolCall(reply);
+    let effectiveMemory = memoryFacts;
 
     if (toolCall) {
       const toolResultText = await runTool(toolCall);
+
+      // If the model just saved a fact, pick up the fresh memory list
+      // immediately so the very next reply (and future turns) reflect it.
+      if (toolCall.name === "remember") {
+        effectiveMemory = loadMemory();
+        setMemoryFacts(effectiveMemory);
+      }
+
       // Feed the tool result back to the model as a fresh user turn so it can
       // phrase the final spoken reply conversationally, without ever showing
       // the raw tool JSON to the person.
@@ -410,7 +588,7 @@ function App() {
           text: `Tool result: ${toolResultText}. Reply to the user conversationally based on this, do not mention tools or JSON.`,
         },
       ];
-      reply = await askEngineer(withToolContext);
+      reply = await askEngineer(withToolContext, effectiveMemory);
     }
 
     // Prepare the audio BEFORE showing the reply, so the text bubble and the
@@ -456,10 +634,14 @@ function App() {
 
       recognition.onresult = (event) => {
         let interim = "";
-        for (let i = 0; i < event.results.length; i++) {
+        // Only walk results from resultIndex onward — event.results
+        // accumulates every segment since start(), so re-scanning from 0
+        // on each callback re-appended already-finalized text and
+        // duplicated it in finalTranscript.
+        for (let i = event.resultIndex; i < event.results.length; i++) {
           const result = event.results[i];
           const transcript = result[0].transcript;
-          if ((result as any).isFinal) {
+          if (result.isFinal) {
             finalTranscript += transcript + " ";
           } else {
             interim += transcript;
@@ -574,6 +756,12 @@ function App() {
             </div>
           </div>
           <button
+            onClick={() => setShowHistory((v) => !v)}
+            className="px-3 py-2 text-[10px] font-bold tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors"
+          >
+            ☰ History
+          </button>
+          <button
             onClick={callActive ? endCall : startCall}
             className={`px-4 py-2 text-[10px] font-bold tracking-[0.2em] uppercase border transition-colors ${
               callActive
@@ -587,6 +775,82 @@ function App() {
       </header>
 
       <div className="relative flex-1 flex overflow-hidden z-10">
+        {/* history + memory panel */}
+        {showHistory && (
+          <div className="absolute inset-y-0 left-0 w-72 z-30 bg-[#03060a]/95 border-r border-[#123047] backdrop-blur-sm flex flex-col p-4 gap-2 overflow-y-auto">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[10px] tracking-[0.3em] text-[#3d6b85] uppercase">
+                Chat History
+              </span>
+              <button
+                onClick={() => setShowHistory(false)}
+                className="text-[#3d6b85] hover:text-[#3ddcff] text-xs"
+              >
+                ✕
+              </button>
+            </div>
+
+            <button
+              onClick={startNewConversation}
+              className="text-left px-3 py-2 border border-[#3ddcff] text-[#3ddcff] text-[10px] font-bold tracking-widest uppercase hover:bg-[#3ddcff]/10 transition-colors"
+            >
+              + New Chat
+            </button>
+
+            <div className="mt-2 flex flex-col gap-1">
+              {conversations.length === 0 && (
+                <p className="text-[#3d6b85] text-xs">No saved chats yet.</p>
+              )}
+              {conversations.map((c) => (
+                <div
+                  key={c.id}
+                  onClick={() => selectConversation(c.id)}
+                  className={`group flex items-center justify-between px-3 py-2 border cursor-pointer text-xs transition-colors ${
+                    c.id === currentConversationId
+                      ? "border-[#3ddcff] bg-[#3ddcff]/10 text-[#8fe3ff]"
+                      : "border-[#123047] text-[#c9e8f7] hover:border-[#1c5578]"
+                  }`}
+                >
+                  <span className="truncate">{c.title}</span>
+                  <button
+                    onClick={(e) => deleteConversation(c.id, e)}
+                    className="opacity-0 group-hover:opacity-100 text-[#ff5d5d] ml-2 shrink-0"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-4 pt-3 border-t border-[#123047]">
+              <span className="text-[10px] tracking-[0.3em] text-[#3d6b85] uppercase">
+                Memory
+              </span>
+              <div className="mt-2 flex flex-col gap-1">
+                {memoryFacts.length === 0 && (
+                  <p className="text-[#3d6b85] text-xs">
+                    Nothing remembered yet.
+                  </p>
+                )}
+                {memoryFacts.map((fact, i) => (
+                  <div
+                    key={i}
+                    className="group flex items-center justify-between px-2 py-1 text-[11px] text-[#c9e8f7]"
+                  >
+                    <span className="truncate">{fact}</span>
+                    <button
+                      onClick={() => forgetFact(i)}
+                      className="opacity-0 group-hover:opacity-100 text-[#ff5d5d] ml-2 shrink-0"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* telemetry sidebar */}
         <aside className="hidden md:flex w-56 shrink-0 border-r border-[#123047] flex-col p-4 gap-3 bg-[#03060a]/60">
           <div className="text-[9px] tracking-[0.3em] text-[#3d6b85] uppercase mb-1">
