@@ -4,6 +4,9 @@ import { createClient } from "@supabase/supabase-js";
 const GEMMA_API_KEY = import.meta.env.VITE_GEMMA_API_KEY;
 const CHAT_MODEL = "gemma-4-26b-a4b-it";
 const TTS_MODEL = "gemini-2.5-flash-preview-tts";
+// Used only for research_idea, since it needs Google Search grounding —
+// the open-weight Gemma chat model doesn't support built-in tools.
+const RESEARCH_MODEL = "gemini-2.5-flash";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -11,6 +14,14 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 const CONV_STORAGE_KEY = "jarvis_conversations";
 const MEMORY_STORAGE_KEY = "jarvis_memory";
+
+// Keep this many of the most recent messages verbatim in every API call;
+// anything older than that gets folded into a running summary instead of
+// being dropped, so the assistant doesn't lose context in long sessions.
+const RECENT_MESSAGE_LIMIT = 300;
+// Only re-summarize once the raw history grows this far past the recent
+// window, so we're not re-summarizing on every single turn.
+const SUMMARIZE_TRIGGER = RECENT_MESSAGE_LIMIT + 50;
 
 type Role = "user" | "model";
 interface Message {
@@ -23,6 +34,9 @@ interface Conversation {
   title: string;
   messages: Message[];
   updatedAt: number;
+  // Running summary of everything older than the recent window — persisted
+  // so it survives switching chats or reloading the page.
+  summary?: string;
 }
 
 function loadConversations(): Conversation[] {
@@ -54,7 +68,10 @@ function titleFromMessages(messages: Message[]): string {
   return trimmed.length > 40 ? trimmed.slice(0, 40) + "…" : trimmed;
 }
 
-function buildSystemInstruction(memoryFacts: string[]): string {
+function buildSystemInstruction(
+  memoryFacts: string[],
+  conversationSummary?: string,
+): string {
   const lines = [
     "You are Engineer, a helpful personal voice assistant.",
     "Keep replies short and conversational, like a real spoken response — usually 1-3 sentences unless the user clearly wants more detail.",
@@ -62,17 +79,27 @@ function buildSystemInstruction(memoryFacts: string[]): string {
     "Match the language the user is using. If they write in English, reply in English. If they write in Kiswahili, reply in Kiswahili. If they mix English and Kiswahili (Sheng or everyday code-switching), reply naturally in that same mixed, conversational style — do not force pure formal Kiswahili unless the user is doing that themselves.",
     "When walking someone through a multi-step task (like programming or debugging), give ONE step at a time, keep it short, then explicitly ask something like 'let me know once you've done that' before moving to the next step. Never dump several steps at once during a live call.",
     "",
-    "You have three tools you can call:",
+    "You have six tools you can call:",
     '1. manage_tasks(action: "add"|"list"|"complete"|"delete", title?: string, task_id?: string) — reads/writes the user\'s task list.',
-    "2. research_idea(idea: string) — runs a business-idea research brief.",
+    "2. research_idea(idea: string) — runs a real web search on a business idea, opens the top source in a new browser tab, and returns a short brief with citations.",
     "3. remember(fact: string) — saves a short, durable fact about the user (their name, preferences, ongoing projects, recurring context) so you can recall it in future conversations, even new ones. Call this whenever the user shares something worth remembering long-term. Do not call it for one-off details that only matter for this exchange.",
+    "4. open_link(url: string, title?: string) — opens a specific URL in a new browser tab. Use this whenever the user asks you to open a link, a website, or a page they name or that came up earlier in the conversation.",
+    "5. write_code(code: string, language?: string, filename?: string) — puts code into the on-screen code editor panel instead of speaking it. Use this whenever the user asks you to write, generate, debug, fix, or add a feature to code, or when they paste code and ask for changes. Always return the FULL updated code in the code argument, not just a snippet or diff.",
+    "6. build_app(html: string, title?: string) — use this whenever the user asks you to build them an app, a website, a tool, or anything they want to actually see running and interact with (not just a code snippet). The html argument must be ONE complete, self-contained HTML document starting with <!DOCTYPE html>, with all CSS in a <style> tag and all JS in a <script> tag inline — no external files, no build step, no import statements. Keep it fully working with no placeholders. This opens a live preview and a link the user can open in a new tab.",
     "When the user's request needs one of these, respond with ONLY strict JSON and nothing else, no markdown fences: ",
     '{"tool_call": {"name": "manage_tasks", "arguments": {"action": "add", "title": "..."}}}',
     "or",
     '{"tool_call": {"name": "research_idea", "arguments": {"idea": "..."}}}',
     "or",
     '{"tool_call": {"name": "remember", "arguments": {"fact": "..."}}}',
-    "Otherwise just respond normally in plain conversational text.",
+    "or",
+    '{"tool_call": {"name": "open_link", "arguments": {"url": "...", "title": "..."}}}',
+    "or",
+    '{"tool_call": {"name": "write_code", "arguments": {"code": "...", "language": "...", "filename": "..."}}}',
+    "or",
+    '{"tool_call": {"name": "build_app", "arguments": {"html": "<!DOCTYPE html>...", "title": "..."}}}',
+    "Otherwise just respond normally in plain conversational text. Never read code out loud or paste large code blocks into a normal spoken reply — always use write_code or build_app for that and just briefly describe what you changed.",
+    "If the user asks you to explain code (e.g. 'explain this' or 'walk me through every line'), do NOT call write_code and do NOT wrap anything in triple-backtick code fences — just explain it in plain conversational prose, referencing lines by what they do rather than quoting them verbatim, going through it in order from top to bottom.",
   ];
   if (memoryFacts.length > 0) {
     lines.push(
@@ -80,6 +107,13 @@ function buildSystemInstruction(memoryFacts: string[]): string {
       "Known facts about this user you already remember: " +
         memoryFacts.join("; ") +
         ".",
+    );
+  }
+  if (conversationSummary && conversationSummary.trim()) {
+    lines.push(
+      "",
+      "Summary of the earlier part of this conversation (older messages were condensed into this so you don't lose context): " +
+        conversationSummary.trim(),
     );
   }
   return lines.join(" ");
@@ -108,7 +142,13 @@ function extractFinalAnswer(json: GeminiResponse): string {
 
 // ---- Tool-call detection ----
 interface ToolCall {
-  name: "manage_tasks" | "research_idea" | "remember";
+  name:
+    | "manage_tasks"
+    | "research_idea"
+    | "remember"
+    | "open_link"
+    | "write_code"
+    | "build_app";
   arguments: Record<string, any>;
 }
 
@@ -163,20 +203,116 @@ async function manageTasks(args: Record<string, any>): Promise<string> {
   return "Unrecognized task action.";
 }
 
-// Stub — no real research pipeline wired up yet. Saves a placeholder brief
-// to idea_research so the table/flow is exercised, and returns a canned summary.
+// Runs a real, Google Search-grounded research pass on the idea, saves the
+// brief (with sources) to Supabase, and opens the top source in a new tab.
+// Note: because this fires after an `await`, some browsers' popup blockers
+// may still swallow the window.open — that's a browser limitation, not a bug
+// here. If it gets blocked, the link is still returned in the reply/brief.
 async function researchIdea(args: Record<string, any>): Promise<string> {
   const { idea } = args;
-  const placeholderBrief = {
-    idea,
-    status: "stub",
-    note: "Research pipeline not implemented yet — this is a placeholder brief.",
-  };
-  const { error } = await supabase
-    .from("idea_research")
-    .insert({ idea_text: idea, brief: placeholderBrief });
-  if (error) return `Couldn't save the research brief: ${error.message}`;
-  return `Noted your idea "${idea}". The research pipeline isn't wired up yet, so this is just a placeholder brief for now.`;
+  if (!idea || !String(idea).trim()) return "No idea given to research.";
+
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${RESEARCH_MODEL}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMMA_API_KEY,
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `Research this business idea and give a short, practical brief (a few sentences) covering market demand, likely competitors, and the biggest risk: "${idea}"`,
+                },
+              ],
+            },
+          ],
+          tools: [{ google_search: {} }],
+        }),
+      },
+    );
+    const json = await res.json();
+    if (!res.ok) {
+      console.error("Research error", json);
+      return `Couldn't research "${idea}" right now — check the console.`;
+    }
+
+    const candidate = json.candidates?.[0];
+    const summary = (candidate?.content?.parts ?? [])
+      .map((p: GeminiPart) => p.text ?? "")
+      .join("")
+      .trim();
+
+    const chunks = candidate?.groundingMetadata?.groundingChunks ?? [];
+    const links: { uri: string; title?: string }[] = chunks
+      .map((c: any) => c.web)
+      .filter((w: any) => w?.uri)
+      .slice(0, 3);
+
+    // Only auto-open the single top source — opening several at once is far
+    // more likely to get blocked entirely by the browser's popup blocker.
+    if (links[0]) {
+      try {
+        window.open(links[0].uri, "_blank", "noopener,noreferrer");
+      } catch {
+        /* popup blocked — non-fatal, link is still in the saved brief */
+      }
+    }
+
+    const brief = { idea, summary, sources: links };
+    const { error } = await supabase
+      .from("idea_research")
+      .insert({ idea_text: idea, brief });
+    if (error) console.error("Couldn't save research brief:", error.message);
+
+    const sourceNote = links.length
+      ? ` I opened the top source in a new tab for you${
+          links.length > 1 ? ` and found ${links.length - 1} more.` : "."
+        }`
+      : " I couldn't find citable sources for this one.";
+    return `${summary || `Here's what I found on "${idea}".`}${sourceNote}`;
+  } catch (err) {
+    console.error("Research request failed", err);
+    return `Couldn't research "${idea}" right now — check the console.`;
+  }
+}
+
+// Opens a specific URL the user (or the model) names. Same popup-blocker
+// caveat as above applies when this runs off a voice turn rather than a
+// direct click.
+async function openLink(args: Record<string, any>): Promise<string> {
+  const { url, title } = args;
+  if (!url || !String(url).trim()) return "No URL given to open.";
+  try {
+    const win = window.open(url, "_blank", "noopener,noreferrer");
+    if (!win) {
+      return `Tried to open ${title || url}, but the browser blocked the popup — you may need to allow popups for this site.`;
+    }
+    return `Opened ${title || url} in a new tab.`;
+  } catch (err) {
+    console.error("open_link failed", err);
+    return `Couldn't open ${url}.`;
+  }
+}
+
+// Pulls the first fenced code block out of a reply, if any, so it can be
+// routed to the code editor panel instead of spoken/shown as raw text.
+function extractCodeBlock(
+  text: string,
+): { code: string; language: string; cleanText: string } | null {
+  const match = text.match(/```(\w+)?\r?\n([\s\S]*?)```/);
+  if (!match) return null;
+  const language = match[1] || "text";
+  const code = match[2].trim();
+  const start = match.index ?? 0;
+  const end = start + match[0].length;
+  const cleanText = (text.slice(0, start) + text.slice(end)).trim();
+  return { code, language, cleanText };
 }
 
 async function rememberFact(args: Record<string, any>): Promise<string> {
@@ -198,12 +334,59 @@ async function runTool(call: ToolCall): Promise<string> {
   if (call.name === "manage_tasks") return manageTasks(call.arguments);
   if (call.name === "research_idea") return researchIdea(call.arguments);
   if (call.name === "remember") return rememberFact(call.arguments);
+  if (call.name === "open_link") return openLink(call.arguments);
+  // write_code is intercepted in sendMessage before runTool is called,
+  // since it needs to update the code editor's React state.
   return "Unknown tool.";
+}
+
+// Speech-to-text is often garbled — false starts, mis-heard words, filler.
+// This runs the raw transcript through the model once to clean it up into
+// what the person most likely meant, WITHOUT answering it or changing its
+// meaning, before it ever reaches the main reasoning/tool-call pipeline.
+// Only used for voice input; typed messages skip this and go straight in.
+async function refineTranscript(raw: string): Promise<string> {
+  const trimmed = raw.trim();
+  if (!trimmed) return raw;
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMMA_API_KEY,
+        },
+        body: JSON.stringify({
+          system_instruction: {
+            parts: [
+              {
+                text: "You clean up raw speech-to-text transcripts. Fix garbled or mis-transcribed words, remove filler ('um', 'uh', false starts, stutters), correct grammar and punctuation, and improve word choice for clarity where it helps — but keep the SAME sentence structure, the SAME context, and the SAME overall sentence, just better phrased. NEVER change the meaning, NEVER add information that wasn't there, NEVER restructure it into a different sentence or a different request, and never answer or act on the request — only polish the wording. If the transcript naturally mixes English and Kiswahili/Sheng, preserve that mix. Respond with ONLY the cleaned-up text and nothing else — no preamble, no quotes, no explanation.",
+              },
+            ],
+          },
+          contents: [{ role: "user", parts: [{ text: trimmed }] }],
+        }),
+      },
+    );
+    const json = await res.json();
+    if (!res.ok) {
+      console.error("Transcript refine error", json);
+      return raw;
+    }
+    const cleaned = extractFinalAnswer(json).trim();
+    if (cleaned) console.log("Refined transcript:", raw, "→", cleaned);
+    return cleaned || raw;
+  } catch (err) {
+    console.error("Transcript refine failed", err);
+    return raw;
+  }
 }
 
 async function askEngineer(
   history: Message[],
   memoryFacts: string[],
+  conversationSummary?: string,
 ): Promise<string> {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent`,
@@ -215,7 +398,9 @@ async function askEngineer(
       },
       body: JSON.stringify({
         system_instruction: {
-          parts: [{ text: buildSystemInstruction(memoryFacts) }],
+          parts: [
+            { text: buildSystemInstruction(memoryFacts, conversationSummary) },
+          ],
         },
         contents: history.map((m) => ({
           role: m.role,
@@ -230,6 +415,74 @@ async function askEngineer(
     return "Something went wrong talking to the model — check the console.";
   }
   return extractFinalAnswer(json);
+}
+
+// Folds everything older than the recent window into a compact running
+// summary via a separate, cheap model call, so long conversations don't
+// silently blow past the context window or lose earlier context. Returns
+// the trimmed message list to actually send to the model, plus the updated
+// summary to persist alongside the conversation.
+async function condenseHistory(
+  fullHistory: Message[],
+  priorSummary: string,
+): Promise<{ apiMessages: Message[]; summary: string }> {
+  if (fullHistory.length <= SUMMARIZE_TRIGGER) {
+    return { apiMessages: fullHistory, summary: priorSummary };
+  }
+
+  const toSummarize = fullHistory.slice(
+    0,
+    fullHistory.length - RECENT_MESSAGE_LIMIT,
+  );
+  const recent = fullHistory.slice(-RECENT_MESSAGE_LIMIT);
+
+  const transcript = toSummarize
+    .map((m) => `${m.role === "user" ? "User" : "Jarvis"}: ${m.text}`)
+    .join("\n");
+
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMMA_API_KEY,
+        },
+        body: JSON.stringify({
+          system_instruction: {
+            parts: [
+              {
+                text: "You condense conversation history into a compact running summary. Preserve concrete facts, names, decisions, ongoing tasks, and the current state of any code being worked on. Drop small talk and anything no longer relevant. Respond with ONLY the updated summary text, under 200 words, no preamble.",
+              },
+            ],
+          },
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `Previous summary (may be empty): ${priorSummary || "(none yet)"}\n\nNew messages to fold in:\n${transcript}\n\nWrite the updated combined summary.`,
+                },
+              ],
+            },
+          ],
+        }),
+      },
+    );
+    const json = await res.json();
+    if (!res.ok) {
+      console.error("Summarization error", json);
+      // Fall back to just trimming without summarizing rather than losing
+      // the request entirely.
+      return { apiMessages: recent, summary: priorSummary };
+    }
+    const summary = extractFinalAnswer(json).trim();
+    return { apiMessages: recent, summary };
+  } catch (err) {
+    console.error("Summarization request failed", err);
+    return { apiMessages: recent, summary: priorSummary };
+  }
 }
 
 // ---- Gemini TTS: real Swahili/English voice, not the robotic browser one ----
@@ -374,6 +627,21 @@ function getSpeechRecognition(): SpeechRecognitionLike | null {
   return new Impl();
 }
 
+type CallPhase = "idle" | "listening" | "thinking" | "coding" | "speaking";
+
+function phaseColor(phase: CallPhase): string {
+  switch (phase) {
+    case "thinking":
+      return "#ffb35d";
+    case "coding":
+      return "#c792ff";
+    case "speaking":
+      return "#6dffb0";
+    default:
+      return "#3ddcff";
+  }
+}
+
 const TELEMETRY_LINES = [
   "PWR CORE ......... STABLE",
   "NEURAL SYNC ...... 98.2%",
@@ -445,8 +713,32 @@ function App() {
     const convos = loadConversations();
     return convos[0]?.messages ?? [];
   });
+  const [conversationSummary, setConversationSummary] = useState<string>(() => {
+    const convos = loadConversations();
+    return convos[0]?.summary ?? "";
+  });
   const [memoryFacts, setMemoryFacts] = useState<string[]>(() => loadMemory());
   const [showHistory, setShowHistory] = useState(false);
+
+  const [codeEditor, setCodeEditor] = useState<{
+    code: string;
+    language: string;
+    filename: string;
+  }>({ code: "", language: "", filename: "" });
+  const [showCodeEditor, setShowCodeEditor] = useState(false);
+  const [pastedCode, setPastedCode] = useState("");
+  const [codeInstruction, setCodeInstruction] = useState("");
+  const [copyLabel, setCopyLabel] = useState("Copy");
+
+  const [appPreview, setAppPreview] = useState<{
+    html: string;
+    title: string;
+    url: string;
+  }>({ html: "", title: "", url: "" });
+  const [showAppPreview, setShowAppPreview] = useState(false);
+  const [appLinkLabel, setAppLinkLabel] = useState("Copy link");
+  const [isStreamingCode, setIsStreamingCode] = useState(false);
+  const streamTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -460,9 +752,7 @@ function App() {
   const telemetry = useTelemetryFeed(listening || loading);
 
   const [callActive, setCallActive] = useState(false);
-  const [phase, setPhase] = useState<
-    "idle" | "listening" | "thinking" | "speaking"
-  >("idle");
+  const [phase, setPhase] = useState<CallPhase>("idle");
   const callActiveRef = useRef(false);
   useEffect(() => {
     callActiveRef.current = callActive;
@@ -470,6 +760,12 @@ function App() {
 
   useEffect(() => {
     setVoiceSupported(getSpeechRecognition() !== null);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (streamTimerRef.current) clearInterval(streamTimerRef.current);
+    };
   }, []);
 
   useEffect(() => {
@@ -490,6 +786,7 @@ function App() {
         title: titleFromMessages(messages),
         messages,
         updatedAt: Date.now(),
+        summary: conversationSummary,
       };
 
       const next =
@@ -507,11 +804,12 @@ function App() {
 
       return next;
     });
-  }, [messages, currentConversationId]);
+  }, [messages, currentConversationId, conversationSummary]);
 
   function startNewConversation() {
     setCurrentConversationId(makeId());
     setMessages([]);
+    setConversationSummary("");
     setShowHistory(false);
   }
 
@@ -520,6 +818,7 @@ function App() {
     if (!convo) return;
     setCurrentConversationId(id);
     setMessages(convo.messages);
+    setConversationSummary(convo.summary ?? "");
     setShowHistory(false);
   }
 
@@ -564,12 +863,55 @@ function App() {
     setLoading(true);
     setPhase("thinking");
 
-    let reply = await askEngineer(nextMessages, memoryFacts);
+    // Condense anything past the recent window into the running summary
+    // before talking to the model, so long conversations don't quietly blow
+    // past the context limit or lose earlier context.
+    const { apiMessages, summary } = await condenseHistory(
+      nextMessages,
+      conversationSummary,
+    );
+    if (summary !== conversationSummary) setConversationSummary(summary);
+
+    let reply = await askEngineer(apiMessages, memoryFacts, summary);
     const toolCall = tryParseToolCall(reply);
     let effectiveMemory = memoryFacts;
 
     if (toolCall) {
-      const toolResultText = await runTool(toolCall);
+      let toolResultText: string;
+
+      if (toolCall.name === "write_code") {
+        setPhase("coding");
+        const { code, language, filename } = toolCall.arguments;
+        revealCodeInEditor(
+          String(code ?? ""),
+          String(language ?? "text"),
+          filename ? String(filename) : "",
+        );
+        toolResultText = `Put the code in the editor panel${
+          filename ? ` as ${filename}` : ""
+        } — let me know if you want anything changed.`;
+      } else if (toolCall.name === "build_app") {
+        setPhase("coding");
+        const { html, title } = toolCall.arguments;
+        const htmlStr = String(html ?? "");
+        // Keep the blob URL ready for the App tab, but don't switch to it —
+        // the code editor is what should be visible while this is happening.
+        setAppPreview((prev) => {
+          if (prev.url) URL.revokeObjectURL(prev.url);
+          const blob = new Blob([htmlStr], { type: "text/html" });
+          return {
+            html: htmlStr,
+            title: title ? String(title) : "",
+            url: URL.createObjectURL(blob),
+          };
+        });
+        revealCodeInEditor(htmlStr, "html", title ? String(title) : "app.html");
+        toolResultText = `Put the code for${
+          title ? ` "${title}"` : " the app"
+        } in the editor panel — open the App tab whenever you want to preview it or open it in a new tab.`;
+      } else {
+        toolResultText = await runTool(toolCall);
+      }
 
       // If the model just saved a fact, pick up the fresh memory list
       // immediately so the very next reply (and future turns) reflect it.
@@ -580,26 +922,58 @@ function App() {
 
       // Feed the tool result back to the model as a fresh user turn so it can
       // phrase the final spoken reply conversationally, without ever showing
-      // the raw tool JSON to the person.
+      // the raw tool JSON to the person. Built off the same condensed
+      // history that was just sent, so token counts stay consistent.
       const withToolContext: Message[] = [
-        ...nextMessages,
+        ...apiMessages,
         {
           role: "user",
-          text: `Tool result: ${toolResultText}. Reply to the user conversationally based on this, do not mention tools or JSON.`,
+          text: `Tool result: ${toolResultText}. Reply to the user conversationally based on this, do not mention tools or JSON. Do not repeat any code in this reply.`,
         },
       ];
-      reply = await askEngineer(withToolContext, effectiveMemory);
+      reply = await askEngineer(withToolContext, effectiveMemory, summary);
+    }
+
+    // If the model ignored the tools and just dropped a fenced code block
+    // into plain text, catch it here too. Everything goes to the code
+    // editor (with a progressive reveal) — a full HTML document also keeps
+    // its blob URL ready for the App tab, but doesn't auto-switch to it.
+    let displayText = reply;
+    const codeBlock = extractCodeBlock(reply);
+    if (codeBlock) {
+      const looksLikeFullApp =
+        /^\s*(<!doctype html|<html)/i.test(codeBlock.code) ||
+        codeBlock.language.toLowerCase() === "html";
+      if (looksLikeFullApp && /<html/i.test(codeBlock.code)) {
+        setAppPreview((prev) => {
+          if (prev.url) URL.revokeObjectURL(prev.url);
+          const blob = new Blob([codeBlock.code], { type: "text/html" });
+          return {
+            html: codeBlock.code,
+            title: "",
+            url: URL.createObjectURL(blob),
+          };
+        });
+        revealCodeInEditor(codeBlock.code, "html", "");
+        displayText =
+          codeBlock.cleanText ||
+          "I've put the code in the editor panel — open the App tab to preview it.";
+      } else {
+        revealCodeInEditor(codeBlock.code, codeBlock.language, "");
+        displayText =
+          codeBlock.cleanText || "I've put the code in the editor panel.";
+      }
     }
 
     // Prepare the audio BEFORE showing the reply, so the text bubble and the
     // voice appear together instead of the text sitting there silently first.
-    const audio = await prepareSpeech(reply);
+    const audio = await prepareSpeech(displayText);
 
-    setMessages([...nextMessages, { role: "model", text: reply }]);
+    setMessages([...nextMessages, { role: "model", text: displayText }]);
     setLoading(false);
     setPhase("speaking");
 
-    await playAndWait(audio, reply);
+    await playAndWait(audio, displayText);
 
     if (callActiveRef.current) {
       setPhase("listening");
@@ -679,7 +1053,10 @@ function App() {
       beginCallTurn();
       return;
     }
-    sendMessage(transcript);
+    setPhase("thinking");
+    const refined = await refineTranscript(transcript);
+    if (!callActiveRef.current) return;
+    sendMessage(refined);
   }
 
   function startCall() {
@@ -702,9 +1079,106 @@ function App() {
       recognitionRef.current?.stop();
       return;
     }
-    listenOnce().then((transcript) => {
-      if (transcript) sendMessage(transcript);
+    listenOnce().then(async (transcript) => {
+      if (!transcript) return;
+      setPhase("thinking");
+      const refined = await refineTranscript(transcript);
+      sendMessage(refined);
     });
+  }
+
+  // Reveals code into the editor progressively rather than snapping straight
+  // to the final result, so there's visible "code progress" to watch. This
+  // is a reveal animation of the already-received code (the chat API here
+  // isn't a streaming endpoint) — not a re-generation in real time, but it
+  // gives the same sense of watching it get written.
+  function revealCodeInEditor(
+    code: string,
+    language: string,
+    filename: string,
+  ) {
+    if (streamTimerRef.current) clearInterval(streamTimerRef.current);
+    setShowCodeEditor(true);
+    setIsStreamingCode(true);
+    setCodeEditor({ code: "", language, filename });
+
+    const totalSteps = 60;
+    const chunkSize = Math.max(3, Math.ceil(code.length / totalSteps));
+    let i = 0;
+    streamTimerRef.current = setInterval(() => {
+      i += chunkSize;
+      if (i >= code.length) {
+        setCodeEditor({ code, language, filename });
+        setIsStreamingCode(false);
+        if (streamTimerRef.current) clearInterval(streamTimerRef.current);
+        streamTimerRef.current = null;
+      } else {
+        setCodeEditor((prev) => ({ ...prev, code: code.slice(0, i) }));
+      }
+    }, 18);
+  }
+
+  async function copyCode() {
+    try {
+      await navigator.clipboard.writeText(codeEditor.code);
+      setCopyLabel("Copied!");
+    } catch {
+      setCopyLabel("Copy failed");
+    } finally {
+      setTimeout(() => setCopyLabel("Copy"), 1500);
+    }
+  }
+
+  async function copyAppLink() {
+    try {
+      await navigator.clipboard.writeText(appPreview.url);
+      setAppLinkLabel("Copied!");
+    } catch {
+      setAppLinkLabel("Copy failed");
+    } finally {
+      setTimeout(() => setAppLinkLabel("Copy link"), 1500);
+    }
+  }
+
+  // Panels share the right-hand slot, so opening one closes the other
+  // rather than letting them stack and overlap.
+  function toggleCodeEditor() {
+    setShowCodeEditor((v) => !v);
+    setShowAppPreview(false);
+  }
+
+  function toggleAppPreview() {
+    setShowAppPreview((v) => !v);
+    setShowCodeEditor(false);
+  }
+
+  // Sends the current editor code back to Jarvis asking for a plain-language,
+  // line-by-line walkthrough. Kept as a normal chat/spoken reply (not routed
+  // back into the editor) since an explanation is prose, not new code.
+  function explainCode() {
+    if (!codeEditor.code.trim() || loading) return;
+    sendMessage(
+      `Explain this code line by line, in plain language:\n${codeEditor.code}`,
+    );
+  }
+
+  // Sends whatever code was pasted, plus the instruction, as one message —
+  // the model will respond with write_code (or a fenced block), both of
+  // which get routed straight back into the editor panel. Can be called as
+  // many times as needed; there's no cap on rounds of edits.
+  function submitCodeRequest() {
+    const code = pastedCode.trim();
+    const instruction = codeInstruction.trim();
+    if (!code && !instruction) return;
+
+    let prompt = "";
+    if (code) {
+      prompt += `Here is my code:\n\`\`\`\n${code}\n\`\`\`\n`;
+    }
+    prompt += instruction || "Please review this and suggest improvements.";
+
+    sendMessage(prompt);
+    setCodeInstruction("");
   }
 
   return (
@@ -725,26 +1199,26 @@ function App() {
       <div className="pointer-events-none absolute bottom-3 left-3 w-10 h-10 border-b-2 border-l-2 border-[#3ddcff]/60" />
       <div className="pointer-events-none absolute bottom-3 right-3 w-10 h-10 border-b-2 border-r-2 border-[#3ddcff]/60" />
 
-      <header className="relative px-6 py-4 border-b border-[#123047] flex items-center justify-between z-10">
-        <div className="flex items-center gap-3">
+      <header className="relative px-3 sm:px-6 py-3 sm:py-4 border-b border-[#123047] flex flex-wrap items-center justify-between gap-y-2 gap-x-3 z-10">
+        <div className="flex items-center gap-2 sm:gap-3">
           <span
-            className="w-2.5 h-2.5 rounded-full"
+            className="w-2 h-2 sm:w-2.5 sm:h-2.5 rounded-full shrink-0"
             style={{
               background: listening ? "#ff9d4d" : "#3ddcff",
               boxShadow: `0 0 10px 2px ${listening ? "#ff9d4d" : "#3ddcff"}`,
             }}
           />
           <div>
-            <h1 className="text-lg tracking-[0.35em] font-bold text-[#8fe3ff]">
+            <h1 className="text-sm sm:text-lg tracking-[0.25em] sm:tracking-[0.35em] font-bold text-[#8fe3ff]">
               J.A.R.V.I.S
             </h1>
-            <p className="text-[10px] tracking-widest text-[#3d6b85] uppercase">
+            <p className="hidden sm:block text-[10px] tracking-widest text-[#3d6b85] uppercase">
               Just A Rather Very Intelligent System
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-4">
-          <div className="text-right text-[10px] text-[#3d6b85] uppercase tracking-widest leading-relaxed">
+        <div className="flex items-center gap-2 sm:gap-4 flex-wrap justify-end">
+          <div className="hidden md:block text-right text-[10px] text-[#3d6b85] uppercase tracking-widest leading-relaxed">
             <div>
               Status:{" "}
               <span className="text-[#8fe3ff]">
@@ -757,13 +1231,25 @@ function App() {
           </div>
           <button
             onClick={() => setShowHistory((v) => !v)}
-            className="px-3 py-2 text-[10px] font-bold tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors"
+            className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
           >
-            ☰ History
+            ☰ <span className="hidden sm:inline">History</span>
+          </button>
+          <button
+            onClick={toggleCodeEditor}
+            className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
+          >
+            {"</>"} <span className="hidden sm:inline">Code</span>
+          </button>
+          <button
+            onClick={toggleAppPreview}
+            className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
+          >
+            ▶ <span className="hidden sm:inline">App</span>
           </button>
           <button
             onClick={callActive ? endCall : startCall}
-            className={`px-4 py-2 text-[10px] font-bold tracking-[0.2em] uppercase border transition-colors ${
+            className={`px-3 sm:px-4 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border transition-colors whitespace-nowrap ${
               callActive
                 ? "border-[#ff5d5d] text-[#ff5d5d] hover:bg-[#ff5d5d]/10"
                 : "border-[#3ddcff] text-[#3ddcff] hover:bg-[#3ddcff]/10"
@@ -777,7 +1263,7 @@ function App() {
       <div className="relative flex-1 flex overflow-hidden z-10">
         {/* history + memory panel */}
         {showHistory && (
-          <div className="absolute inset-y-0 left-0 w-72 z-30 bg-[#03060a]/95 border-r border-[#123047] backdrop-blur-sm flex flex-col p-4 gap-2 overflow-y-auto">
+          <div className="absolute inset-y-0 left-0 w-full sm:w-72 z-30 bg-[#03060a]/95 border-r border-[#123047] backdrop-blur-sm flex flex-col p-4 gap-2 overflow-y-auto">
             <div className="flex items-center justify-between mb-1">
               <span className="text-[10px] tracking-[0.3em] text-[#3d6b85] uppercase">
                 Chat History
@@ -851,6 +1337,162 @@ function App() {
           </div>
         )}
 
+        {/* code editor panel */}
+        {showCodeEditor && (
+          <div className="absolute inset-y-0 right-0 w-full sm:w-[26rem] z-30 bg-[#03060a]/95 border-l border-[#123047] backdrop-blur-sm flex flex-col p-4 gap-3 overflow-y-auto">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[10px] tracking-[0.3em] text-[#3d6b85] uppercase">
+                Code Editor
+              </span>
+              <button
+                onClick={() => setShowCodeEditor(false)}
+                className="text-[#3d6b85] hover:text-[#3ddcff] text-xs"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="border border-[#123047] bg-[#0a0f14] flex flex-col min-h-[12rem]">
+              <div className="flex items-center justify-between px-3 py-2 border-b border-[#123047] text-[9px] uppercase tracking-widest text-[#3d6b85]">
+                <span className="truncate flex items-center gap-2">
+                  {isStreamingCode && (
+                    <span className="text-[#6dffb0]">● writing</span>
+                  )}
+                  <span>
+                    {codeEditor.filename ||
+                      codeEditor.language ||
+                      (isStreamingCode ? "" : "no code yet")}
+                  </span>
+                </span>
+                <div className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={explainCode}
+                    disabled={!codeEditor.code || loading || isStreamingCode}
+                    className="text-[#3ddcff] hover:text-[#8fe3ff] disabled:opacity-30 disabled:hover:text-[#3ddcff] tracking-widest"
+                  >
+                    Explain
+                  </button>
+                  <button
+                    onClick={copyCode}
+                    disabled={!codeEditor.code || isStreamingCode}
+                    className="text-[#3ddcff] hover:text-[#8fe3ff] disabled:opacity-30 disabled:hover:text-[#3ddcff] tracking-widest"
+                  >
+                    {copyLabel}
+                  </button>
+                </div>
+              </div>
+              <pre className="flex-1 overflow-auto p-3 text-[11px] leading-relaxed text-[#c9e8f7] whitespace-pre-wrap break-words">
+                {codeEditor.code ||
+                  (isStreamingCode
+                    ? ""
+                    : "Ask Jarvis to write or debug something, or paste your own code below.")}
+                {isStreamingCode && (
+                  <span className="code-cursor-blink inline-block">▋</span>
+                )}
+              </pre>
+            </div>
+
+            <div className="mt-2 pt-3 border-t border-[#123047] flex flex-col gap-2">
+              <span className="text-[10px] tracking-[0.3em] text-[#3d6b85] uppercase">
+                Paste code to debug or extend
+              </span>
+              <textarea
+                value={pastedCode}
+                onChange={(e) => setPastedCode(e.target.value)}
+                placeholder="Paste your code here..."
+                rows={8}
+                className="bg-[#0a0f14] border border-[#123047] px-3 py-2 text-[11px] text-[#e8f6ff] placeholder-[#2d4f63] outline-none focus:border-[#3ddcff] transition-colors font-mono resize-y"
+              />
+              <input
+                value={codeInstruction}
+                onChange={(e) => setCodeInstruction(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") submitCodeRequest();
+                }}
+                placeholder="e.g. fix this bug / add a dark mode toggle"
+                className="bg-[#0a0f14] border border-[#123047] px-3 py-2 text-xs text-[#e8f6ff] placeholder-[#2d4f63] outline-none focus:border-[#3ddcff] transition-colors"
+              />
+              <button
+                onClick={submitCodeRequest}
+                disabled={
+                  loading || (!pastedCode.trim() && !codeInstruction.trim())
+                }
+                className="px-4 py-2 border border-[#3ddcff] text-[#3ddcff] text-[10px] font-bold tracking-[0.2em] uppercase hover:bg-[#3ddcff]/10 transition-colors disabled:opacity-30"
+              >
+                Send to Jarvis
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* app preview panel */}
+        {showAppPreview && (
+          <div className="absolute inset-y-0 right-0 w-full sm:w-[28rem] z-30 bg-[#03060a]/95 border-l border-[#123047] backdrop-blur-sm flex flex-col p-4 gap-3 overflow-y-auto">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[10px] tracking-[0.3em] text-[#3d6b85] uppercase">
+                App Preview
+              </span>
+              <button
+                onClick={() => setShowAppPreview(false)}
+                className="text-[#3d6b85] hover:text-[#3ddcff] text-xs"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="border border-[#123047] bg-[#0a0f14] flex flex-col">
+              <div className="flex items-center justify-between px-3 py-2 border-b border-[#123047] text-[9px] uppercase tracking-widest text-[#3d6b85]">
+                <span className="truncate">
+                  {appPreview.title || "no app yet"}
+                </span>
+                <div className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={() =>
+                      appPreview.url &&
+                      window.open(
+                        appPreview.url,
+                        "_blank",
+                        "noopener,noreferrer",
+                      )
+                    }
+                    disabled={!appPreview.url}
+                    className="text-[#3ddcff] hover:text-[#8fe3ff] disabled:opacity-30 disabled:hover:text-[#3ddcff] tracking-widest"
+                  >
+                    Open in new tab
+                  </button>
+                  <button
+                    onClick={copyAppLink}
+                    disabled={!appPreview.url}
+                    className="text-[#3ddcff] hover:text-[#8fe3ff] disabled:opacity-30 disabled:hover:text-[#3ddcff] tracking-widest"
+                  >
+                    {appLinkLabel}
+                  </button>
+                </div>
+              </div>
+              {appPreview.html ? (
+                <iframe
+                  title={appPreview.title || "App preview"}
+                  srcDoc={appPreview.html}
+                  sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox"
+                  className="w-full h-[45vh] sm:h-[55vh] bg-white"
+                />
+              ) : (
+                <p className="p-3 text-[11px] text-[#c9e8f7] leading-relaxed">
+                  Ask Jarvis to build you an app, and the live preview will show
+                  up here.
+                </p>
+              )}
+            </div>
+
+            <p className="text-[9px] text-[#3d6b85] leading-relaxed">
+              This link only works on this device for this browser session —
+              it's a local preview, not a hosted public URL. Reloading the page
+              or closing the tab will invalidate it; use "Open in new tab" or
+              copy the code to deploy it somewhere permanent.
+            </p>
+          </div>
+        )}
+
         {/* telemetry sidebar */}
         <aside className="hidden md:flex w-56 shrink-0 border-r border-[#123047] flex-col p-4 gap-3 bg-[#03060a]/60">
           <div className="text-[9px] tracking-[0.3em] text-[#3d6b85] uppercase mb-1">
@@ -870,7 +1512,7 @@ function App() {
         </aside>
 
         <div className="flex-1 flex flex-col">
-          <main className="relative flex-1 overflow-y-auto px-6 py-5 space-y-3">
+          <main className="relative flex-1 overflow-y-auto px-3 sm:px-6 py-4 sm:py-5 space-y-3">
             {callActive && (
               <div className="absolute inset-0 z-20 bg-[#030507]/95 backdrop-blur-sm flex flex-col items-center justify-center gap-6">
                 <div className="relative w-56 h-56 flex items-center justify-center">
@@ -902,13 +1544,7 @@ function App() {
                           y1={y1}
                           x2={x2}
                           y2={y2}
-                          stroke={
-                            phase === "thinking"
-                              ? "#ffb35d"
-                              : phase === "speaking"
-                                ? "#6dffb0"
-                                : "#3ddcff"
-                          }
+                          stroke={phaseColor(phase)}
                           strokeWidth={long ? 2 : 1}
                           opacity={long ? 0.8 : 0.35}
                         />
@@ -918,7 +1554,9 @@ function App() {
                   <svg
                     viewBox="0 0 200 200"
                     className={`absolute inset-0 ${
-                      phase === "thinking" ? "hud-sweep-fast" : "hud-sweep"
+                      phase === "thinking" || phase === "coding"
+                        ? "hud-sweep-fast"
+                        : "hud-sweep"
                     }`}
                   >
                     <defs>
@@ -931,24 +1569,12 @@ function App() {
                       >
                         <stop
                           offset="0%"
-                          stopColor={
-                            phase === "thinking"
-                              ? "#ffb35d"
-                              : phase === "speaking"
-                                ? "#6dffb0"
-                                : "#3ddcff"
-                          }
+                          stopColor={phaseColor(phase)}
                           stopOpacity="0"
                         />
                         <stop
                           offset="100%"
-                          stopColor={
-                            phase === "thinking"
-                              ? "#ffb35d"
-                              : phase === "speaking"
-                                ? "#6dffb0"
-                                : "#3ddcff"
-                          }
+                          stopColor={phaseColor(phase)}
                           stopOpacity="0.55"
                         />
                       </linearGradient>
@@ -963,37 +1589,19 @@ function App() {
                       phase === "speaking" ? "hud-ring-pulse" : "hud-ring-fast"
                     }`}
                     style={{
-                      borderColor:
-                        phase === "thinking"
-                          ? "#ffb35d66"
-                          : phase === "speaking"
-                            ? "#6dffb066"
-                            : "#3ddcff66",
+                      borderColor: `${phaseColor(phase)}66`,
                     }}
                   />
                   <div
                     className={`w-20 h-20 rounded-full border flex items-center justify-center text-[10px] tracking-widest ${
-                      phase === "thinking" ? "hud-core-fast" : "hud-core"
+                      phase === "thinking" || phase === "coding"
+                        ? "hud-core-fast"
+                        : "hud-core"
                     }`}
                     style={{
-                      background:
-                        phase === "thinking"
-                          ? "#ffb35d1a"
-                          : phase === "speaking"
-                            ? "#6dffb01a"
-                            : "#3ddcff1a",
-                      borderColor:
-                        phase === "thinking"
-                          ? "#ffb35d"
-                          : phase === "speaking"
-                            ? "#6dffb0"
-                            : "#3ddcff",
-                      color:
-                        phase === "thinking"
-                          ? "#ffb35d"
-                          : phase === "speaking"
-                            ? "#6dffb0"
-                            : "#8fe3ff",
+                      background: `${phaseColor(phase)}1a`,
+                      borderColor: phaseColor(phase),
+                      color: phase === "idle" ? "#8fe3ff" : phaseColor(phase),
                     }}
                   >
                     {phase.toUpperCase()}
@@ -1003,6 +1611,7 @@ function App() {
                   {phase === "listening" &&
                     "Listening — speak naturally, pause when done"}
                   {phase === "thinking" && "Processing your request"}
+                  {phase === "coding" && "Writing your code"}
                   {phase === "speaking" && "Jarvis is responding"}
                   {phase === "idle" && "Live call active"}
                 </p>
@@ -1095,7 +1704,7 @@ function App() {
                 className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
               >
                 <div
-                  className={`max-w-lg px-4 py-3 text-sm leading-relaxed border backdrop-blur-sm ${
+                  className={`max-w-[88%] sm:max-w-lg px-3 sm:px-4 py-2.5 sm:py-3 text-sm leading-relaxed border backdrop-blur-sm ${
                     m.role === "user"
                       ? "bg-[#0b2338]/70 border-[#1c5578] text-[#eaf7ff] clip-panel-user"
                       : "bg-[#0a0f14]/80 border-[#123047] text-[#c9e8f7] clip-panel-model"
@@ -1138,7 +1747,7 @@ function App() {
             <div ref={endRef} />
           </main>
 
-          <footer className="relative px-6 py-4 border-t border-[#123047] flex items-center gap-3">
+          <footer className="relative px-3 sm:px-6 py-3 sm:py-4 border-t border-[#123047] flex items-center gap-2 sm:gap-3">
             <button
               onClick={() =>
                 setRecognitionLang((prev) =>
@@ -1147,7 +1756,7 @@ function App() {
               }
               disabled={listening}
               title="Toggle voice recognition language"
-              className="shrink-0 w-11 h-11 border border-[#1c5578] flex items-center justify-center text-[10px] font-bold text-[#8fe3ff] bg-[#0a0f14] disabled:opacity-30 hover:border-[#3ddcff] transition-colors"
+              className="shrink-0 w-9 h-9 sm:w-11 sm:h-11 border border-[#1c5578] flex items-center justify-center text-[9px] sm:text-[10px] font-bold text-[#8fe3ff] bg-[#0a0f14] disabled:opacity-30 hover:border-[#3ddcff] transition-colors"
             >
               {recognitionLang === "en-US" ? "EN" : "SW"}
             </button>
@@ -1160,7 +1769,7 @@ function App() {
                   ? "Talk"
                   : "Voice input not supported in this browser"
               }
-              className="relative shrink-0 w-14 h-14 rounded-full flex items-center justify-center disabled:opacity-30"
+              className="relative shrink-0 w-11 h-11 sm:w-14 sm:h-14 rounded-full flex items-center justify-center disabled:opacity-30"
             >
               <span
                 className={`absolute inset-0 rounded-full border ${
@@ -1170,7 +1779,7 @@ function App() {
                 }`}
               />
               <span
-                className={`w-9 h-9 rounded-full flex items-center justify-center text-lg ${
+                className={`w-7 h-7 sm:w-9 sm:h-9 rounded-full flex items-center justify-center text-base sm:text-lg ${
                   listening
                     ? "bg-[#ff9d4d]/20 text-[#ff9d4d]"
                     : "bg-[#3ddcff]/10 text-[#3ddcff]"
@@ -1192,13 +1801,13 @@ function App() {
                 if (e.key === "Enter") sendMessage(input);
               }}
               placeholder="TRANSMIT MESSAGE..."
-              className="flex-1 bg-[#0a0f14] border border-[#123047] px-4 py-2.5 text-sm text-[#e8f6ff] placeholder-[#2d4f63] outline-none focus:border-[#3ddcff] transition-colors tracking-wide"
+              className="flex-1 min-w-0 bg-[#0a0f14] border border-[#123047] px-3 sm:px-4 py-2 sm:py-2.5 text-sm text-[#e8f6ff] placeholder-[#2d4f63] outline-none focus:border-[#3ddcff] transition-colors tracking-wide"
             />
 
             <button
               onClick={() => sendMessage(input)}
               disabled={loading || !input.trim()}
-              className="shrink-0 px-5 py-2.5 border border-[#3ddcff] text-[#3ddcff] text-xs font-bold tracking-[0.2em] uppercase hover:bg-[#3ddcff]/10 transition-colors disabled:opacity-30"
+              className="shrink-0 px-3.5 sm:px-5 py-2 sm:py-2.5 border border-[#3ddcff] text-[#3ddcff] text-[10px] sm:text-xs font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase hover:bg-[#3ddcff]/10 transition-colors disabled:opacity-30"
             >
               Send
             </button>
@@ -1225,6 +1834,7 @@ function App() {
         .hud-core-fast { animation: hud-core-fast-pulse 0.6s ease-in-out infinite; }
         .hud-pulse-dot { width: 6px; height: 6px; border-radius: 9999px; background: #3ddcff; animation: hud-dot-pulse 1s ease-in-out infinite; display: inline-block; }
         .hud-mini-spin { animation: hud-mini-spin-kf 0.8s linear infinite; }
+        .code-cursor-blink { animation: hud-dot-pulse 0.9s ease-in-out infinite; color: #6dffb0; }
         .clip-panel-user { clip-path: polygon(0 0, 100% 0, 100% 100%, 12px 100%, 0 calc(100% - 12px)); }
         .clip-panel-model { clip-path: polygon(12px 0, 100% 0, 100% 100%, 0 100%, 0 12px); }
       `}</style>
