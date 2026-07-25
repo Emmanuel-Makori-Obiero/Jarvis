@@ -2,11 +2,29 @@ import { useEffect, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 const GEMMA_API_KEY = import.meta.env.VITE_GEMMA_API_KEY;
-const CHAT_MODEL = "gemma-4-26b-a4b-it";
+
+// Model fallback chains — all use the SAME API key. We always try the
+// strongest/"best thinking" model first, and only fall through to a
+// faster/cheaper one if the previous call fails for any reason (quota
+// exhausted, rate limited, network error, 5xx, etc). This means a live
+// call never just dies because one model ran out of tokens.
+const THINKING_MODEL_CHAIN = [
+  "gemini-2.5-pro", // best thinking — tried first
+  "gemini-2.5-flash", // fastest — first fallback
+  "gemini-2.5-flash-lite", // last-resort fallback
+];
+// Lighter-weight chain for cheap background tasks (transcript cleanup,
+// history summarization) where we don't need the heaviest model first.
+const FAST_MODEL_CHAIN = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
+// Research needs Google Search grounding, which not every model supports
+// well — keep its own chain.
+const RESEARCH_MODEL_CHAIN = ["gemini-2.5-pro", "gemini-2.5-flash"];
+
 const TTS_MODEL = "gemini-2.5-flash-preview-tts";
-// Used only for research_idea, since it needs Google Search grounding —
-// the open-weight Gemma chat model doesn't support built-in tools.
-const RESEARCH_MODEL = "gemini-2.5-flash";
+// The ONLY voice this app is allowed to speak in. There is no other voice
+// fallback anywhere in this file — if Gemini TTS fails, we stay silent
+// (text-only) rather than ever using the robotic browser voice.
+const TTS_VOICE_NAME = "Leda";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -19,8 +37,8 @@ const TEACHER_MODE_STORAGE_KEY = "jarvis_teacher_mode";
 // Keep this many of the most recent messages verbatim in every API call;
 // anything older than that gets folded into a running summary instead of
 // being dropped, so the assistant doesn't lose context in long sessions.
-// gemma-4-26b-a4b-it has a 128K-256K token context window, so this can be
-// pushed high — most calls/chats will never even approach this and will
+// The thinking-model chain tops out at large context windows, so this can
+// be pushed high — most calls/chats will never even approach this and will
 // always send the full raw history, never a lossy summary.
 const RECENT_MESSAGE_LIMIT = 2000;
 // Only re-summarize once the raw history grows this far past the recent
@@ -32,6 +50,9 @@ interface Message {
   role: Role;
   text: string;
 }
+
+// The four side panels the assistant can open/close hands-free by voice.
+type PanelName = "history" | "code" | "app" | "files";
 
 interface Conversation {
   id: string;
@@ -78,14 +99,14 @@ function buildSystemInstruction(
   teacherMode?: boolean,
 ): string {
   const lines = [
-    "You are Engineer, a helpful personal voice assistant.",
+    "You are Engineer, a helpful personal voice assistant. The user may have a visual or motor impairment and may be relying on you to control the whole interface hands-free — take voice commands about the UI itself (opening/closing panels, opening/closing links) seriously and act on them immediately via tools rather than just describing what they could click.",
     "Keep replies short and conversational, like a real spoken response — usually 1-3 sentences unless the user clearly wants more detail.",
     "Never use markdown, bullet points, or numbered lists in your replies, since they will be read aloud.",
     "Match the language the user is using. If they write in English, reply in English. If they write in Kiswahili, reply in Kiswahili. If they mix English and Kiswahili (Sheng or everyday code-switching), reply naturally in that same mixed, conversational style — do not force pure formal Kiswahili unless the user is doing that themselves.",
     "You are given the FULL conversation history on every turn, including everything said earlier in this call or chat. Actually use it: remember names, numbers, decisions, and anything the user told you earlier in this same session, and refer back to them naturally when relevant. Never ask the user to repeat something they already told you earlier in this conversation — check the history first.",
     "When walking someone through a multi-step task (like programming or debugging), give ONE step at a time, keep it short, then explicitly ask something like 'let me know once you've done that' before moving to the next step. Never dump several steps at once during a live call.",
     "",
-    "You have eight tools you can call:",
+    "You have ten tools you can call:",
     '1. manage_tasks(action: "add"|"list"|"complete"|"delete", title?: string, task_id?: string) — reads/writes the user\'s task list.',
     "2. research_idea(idea: string) — runs a real web search on a business idea, opens the top source in a new browser tab, and returns a short brief with citations.",
     "3. remember(fact: string) — saves a short, durable fact about the user (their name, preferences, ongoing projects, recurring context) so you can recall it in future conversations, even new ones. Call this whenever the user shares something worth remembering long-term. Do not call it for one-off details that only matter for this exchange.",
@@ -94,6 +115,8 @@ function buildSystemInstruction(
     "6. write_code(code: string, language?: string, filename?: string) — puts code into the on-screen code editor panel instead of speaking it. Use this whenever the user asks you to write, generate, debug, fix, or add a feature to code, or when they paste code and ask for changes. Always return the FULL updated code in the code argument, not just a snippet or diff.",
     "7. build_app(html: string, title?: string) — use this whenever the user asks you to build them an app, a website, a tool, or anything they want to actually see running and interact with (not just a code snippet). The html argument must be ONE complete, self-contained HTML document starting with <!DOCTYPE html>, with all CSS in a <style> tag and all JS in a <script> tag inline — no external files, no build step, no import statements. Keep it fully working with no placeholders. This opens a live preview and a link the user can open in a new tab.",
     "8. make_file(content: string, filename?: string) — use this whenever the user asks you to write something they clearly want as a downloadable file rather than a spoken reply or code to run: a document, a report, a letter, notes, a CSV, a list, a plain text or markdown file, etc. Give the filename a sensible extension (e.g. notes.md, data.csv, letter.txt) so it downloads as the right file type. Always return the FULL file content, not a partial draft. This opens a panel with a download link and a copy button.",
+    '9. open_panel(panel: "history"|"code"|"app"|"files") — opens one of the app\'s own side panels hands-free: "history" (chat history + memory + teacher mode toggle), "code" (code editor), "app" (app preview), "files" (downloadable file output). Use this whenever the user says things like "open the history tab", "show me the code panel", "open the app preview", "show my files", etc. This is for the app\'s own UI panels, NOT for external websites — use open_link for those.',
+    '10. close_panel(panel?: "history"|"code"|"app"|"files") — closes one of the app\'s own side panels. If the user just says "close this panel" or "close it" without naming one, call this with no panel argument and it closes whatever is currently open. If they name a specific panel, pass it so the right one closes.',
     "When the user's request needs one of these, respond with ONLY strict JSON and nothing else, no markdown fences: ",
     '{"tool_call": {"name": "manage_tasks", "arguments": {"action": "add", "title": "..."}}}',
     "or",
@@ -110,6 +133,10 @@ function buildSystemInstruction(
     '{"tool_call": {"name": "build_app", "arguments": {"html": "<!DOCTYPE html>...", "title": "..."}}}',
     "or",
     '{"tool_call": {"name": "make_file", "arguments": {"content": "...", "filename": "notes.md"}}}',
+    "or",
+    '{"tool_call": {"name": "open_panel", "arguments": {"panel": "history"}}}',
+    "or",
+    '{"tool_call": {"name": "close_panel", "arguments": {"panel": "history"}}}',
     "Otherwise just respond normally in plain conversational text. Never read code out loud or paste large code blocks into a normal spoken reply — always use write_code or build_app for that and just briefly describe what you changed.",
     "If the user asks you to explain code (e.g. 'explain this' or 'walk me through every line'), do NOT call write_code and do NOT wrap anything in triple-backtick code fences — just explain it in plain conversational prose, referencing lines by what they do rather than quoting them verbatim, going through it in order from top to bottom.",
   ];
@@ -148,7 +175,10 @@ interface GeminiPart {
 }
 
 interface GeminiResponse {
-  candidates?: { content?: { parts?: GeminiPart[] } }[];
+  candidates?: {
+    content?: { parts?: GeminiPart[] };
+    groundingMetadata?: any;
+  }[];
 }
 
 function extractFinalAnswer(json: GeminiResponse): string {
@@ -162,6 +192,45 @@ function extractFinalAnswer(json: GeminiResponse): string {
   );
 }
 
+// ---- Model fallback chain runner ----
+// Tries each model in `models` in order against the same Gemini endpoint,
+// using the SAME API key throughout. Moves to the next model on ANY
+// failure — a non-OK HTTP response, a thrown network error, or a
+// malformed response — so a single exhausted quota or transient outage on
+// the top model never kills the conversation. Returns null only if every
+// model in the chain failed.
+async function callGeminiWithFallback(
+  models: string[],
+  payload: Record<string, any>,
+): Promise<GeminiResponse | null> {
+  for (const model of models) {
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMMA_API_KEY,
+          },
+          body: JSON.stringify(payload),
+        },
+      );
+      const json = await res.json();
+      if (!res.ok) {
+        console.warn(`Model "${model}" returned an error, falling back:`, json);
+        continue;
+      }
+      return json as GeminiResponse;
+    } catch (err) {
+      console.warn(`Model "${model}" request failed, falling back:`, err);
+      continue;
+    }
+  }
+  console.error("All models in fallback chain failed:", models);
+  return null;
+}
+
 // ---- Tool-call detection ----
 interface ToolCall {
   name:
@@ -172,7 +241,9 @@ interface ToolCall {
     | "close_link"
     | "write_code"
     | "build_app"
-    | "make_file";
+    | "make_file"
+    | "open_panel"
+    | "close_panel";
   arguments: Record<string, any>;
 }
 
@@ -237,33 +308,21 @@ async function researchIdea(args: Record<string, any>): Promise<string> {
   if (!idea || !String(idea).trim()) return "No idea given to research.";
 
   try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${RESEARCH_MODEL}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": GEMMA_API_KEY,
-        },
-        body: JSON.stringify({
-          contents: [
+    const json = await callGeminiWithFallback(RESEARCH_MODEL_CHAIN, {
+      contents: [
+        {
+          role: "user",
+          parts: [
             {
-              role: "user",
-              parts: [
-                {
-                  text: `Research this business idea and give a short, practical brief (a few sentences) covering market demand, likely competitors, and the biggest risk: "${idea}"`,
-                },
-              ],
+              text: `Research this business idea and give a short, practical brief (a few sentences) covering market demand, likely competitors, and the biggest risk: "${idea}"`,
             },
           ],
-          tools: [{ google_search: {} }],
-        }),
-      },
-    );
-    const json = await res.json();
-    if (!res.ok) {
-      console.error("Research error", json);
-      return `Couldn't research "${idea}" right now — check the console.`;
+        },
+      ],
+      tools: [{ google_search: {} }],
+    });
+    if (!json) {
+      return `Couldn't research "${idea}" right now — all models are unavailable, check the console.`;
     }
 
     const candidate = json.candidates?.[0];
@@ -435,15 +494,31 @@ async function rememberFact(args: Record<string, any>): Promise<string> {
   return `Got it, I'll remember: ${cleanFact}`;
 }
 
+// Normalizes whatever panel name the model gives us to one of the four
+// known panels, so slightly-off model output ("chat history", "app
+// preview") still resolves correctly.
+function normalizePanelName(raw: unknown): PanelName | null {
+  const s = String(raw ?? "")
+    .trim()
+    .toLowerCase();
+  if (!s) return null;
+  if (s.includes("hist")) return "history";
+  if (s.includes("code") || s.includes("editor")) return "code";
+  if (s.includes("app") || s.includes("preview")) return "app";
+  if (s.includes("file")) return "files";
+  return null;
+}
+
 async function runTool(call: ToolCall): Promise<string> {
   if (call.name === "manage_tasks") return manageTasks(call.arguments);
   if (call.name === "research_idea") return researchIdea(call.arguments);
   if (call.name === "remember") return rememberFact(call.arguments);
   if (call.name === "open_link") return openLink(call.arguments);
   if (call.name === "close_link") return closeLink(call.arguments);
-  // write_code, build_app, and make_file are intercepted in sendMessage
-  // before runTool is called, since they need to update React state
-  // (editor panel, app preview, or file output panel) directly.
+  // write_code, build_app, make_file, open_panel, and close_panel are
+  // intercepted in sendMessage before runTool is called, since they need to
+  // update React state (editor panel, app preview, file output panel, or
+  // side-panel visibility) directly.
   return "Unknown tool.";
 }
 
@@ -456,31 +531,17 @@ async function refineTranscript(raw: string): Promise<string> {
   const trimmed = raw.trim();
   if (!trimmed) return raw;
   try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": GEMMA_API_KEY,
-        },
-        body: JSON.stringify({
-          system_instruction: {
-            parts: [
-              {
-                text: "You clean up raw speech-to-text transcripts. Fix garbled or mis-transcribed words, remove filler ('um', 'uh', false starts, stutters), correct grammar and punctuation, and improve word choice for clarity where it helps — but keep the SAME sentence structure, the SAME context, and the SAME overall sentence, just better phrased. NEVER change the meaning, NEVER add information that wasn't there, NEVER restructure it into a different sentence or a different request, and never answer or act on the request — only polish the wording. If the transcript naturally mixes English and Kiswahili/Sheng, preserve that mix. Respond with ONLY the cleaned-up text and nothing else — no preamble, no quotes, no explanation.",
-              },
-            ],
+    const json = await callGeminiWithFallback(FAST_MODEL_CHAIN, {
+      system_instruction: {
+        parts: [
+          {
+            text: "You clean up raw speech-to-text transcripts. Fix garbled or mis-transcribed words, remove filler ('um', 'uh', false starts, stutters), correct grammar and punctuation, and improve word choice for clarity where it helps — but keep the SAME sentence structure, the SAME context, and the SAME overall sentence, just better phrased. NEVER change the meaning, NEVER add information that wasn't there, NEVER restructure it into a different sentence or a different request, and never answer or act on the request — only polish the wording. If the transcript naturally mixes English and Kiswahili/Sheng, preserve that mix. Respond with ONLY the cleaned-up text and nothing else — no preamble, no quotes, no explanation.",
           },
-          contents: [{ role: "user", parts: [{ text: trimmed }] }],
-        }),
+        ],
       },
-    );
-    const json = await res.json();
-    if (!res.ok) {
-      console.error("Transcript refine error", json);
-      return raw;
-    }
+      contents: [{ role: "user", parts: [{ text: trimmed }] }],
+    });
+    if (!json) return raw;
     const cleaned = extractFinalAnswer(json).trim();
     if (cleaned) console.log("Refined transcript:", raw, "→", cleaned);
     return cleaned || raw;
@@ -496,37 +557,25 @@ async function askEngineer(
   conversationSummary?: string,
   teacherMode?: boolean,
 ): Promise<string> {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMMA_API_KEY,
-      },
-      body: JSON.stringify({
-        system_instruction: {
-          parts: [
-            {
-              text: buildSystemInstruction(
-                memoryFacts,
-                conversationSummary,
-                teacherMode,
-              ),
-            },
-          ],
+  const json = await callGeminiWithFallback(THINKING_MODEL_CHAIN, {
+    system_instruction: {
+      parts: [
+        {
+          text: buildSystemInstruction(
+            memoryFacts,
+            conversationSummary,
+            teacherMode,
+          ),
         },
-        contents: history.map((m) => ({
-          role: m.role,
-          parts: [{ text: m.text }],
-        })),
-      }),
+      ],
     },
-  );
-  const json = await res.json();
-  if (!res.ok) {
-    console.error(json);
-    return "Something went wrong talking to the model — check the console.";
+    contents: history.map((m) => ({
+      role: m.role,
+      parts: [{ text: m.text }],
+    })),
+  });
+  if (!json) {
+    return "Something went wrong talking to the model — every model in the fallback chain failed, check the console.";
   }
   return extractFinalAnswer(json);
 }
@@ -555,38 +604,26 @@ async function condenseHistory(
     .join("\n");
 
   try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": GEMMA_API_KEY,
-        },
-        body: JSON.stringify({
-          system_instruction: {
-            parts: [
-              {
-                text: "You condense conversation history into a compact running summary. Preserve concrete facts, names, decisions, ongoing tasks, and the current state of any code being worked on. Drop small talk and anything no longer relevant. Respond with ONLY the updated summary text, under 200 words, no preamble.",
-              },
-            ],
+    const json = await callGeminiWithFallback(FAST_MODEL_CHAIN, {
+      system_instruction: {
+        parts: [
+          {
+            text: "You condense conversation history into a compact running summary. Preserve concrete facts, names, decisions, ongoing tasks, and the current state of any code being worked on. Drop small talk and anything no longer relevant. Respond with ONLY the updated summary text, under 200 words, no preamble.",
           },
-          contents: [
+        ],
+      },
+      contents: [
+        {
+          role: "user",
+          parts: [
             {
-              role: "user",
-              parts: [
-                {
-                  text: `Previous summary (may be empty): ${priorSummary || "(none yet)"}\n\nNew messages to fold in:\n${transcript}\n\nWrite the updated combined summary.`,
-                },
-              ],
+              text: `Previous summary (may be empty): ${priorSummary || "(none yet)"}\n\nNew messages to fold in:\n${transcript}\n\nWrite the updated combined summary.`,
             },
           ],
-        }),
-      },
-    );
-    const json = await res.json();
-    if (!res.ok) {
-      console.error("Summarization error", json);
+        },
+      ],
+    });
+    if (!json) {
       // Fall back to just trimming without summarizing rather than losing
       // the request entirely.
       return { apiMessages: recent, summary: priorSummary };
@@ -599,7 +636,7 @@ async function condenseHistory(
   }
 }
 
-// ---- Gemini TTS: real Swahili/English voice, not the robotic browser one ----
+// ---- Gemini TTS: the ONE female voice, no fallback voice ever ----
 
 function base64ToUint8Array(base64: string): Uint8Array {
   const binary = atob(base64);
@@ -642,21 +679,9 @@ function pcmToWavBlob(pcmBytes: Uint8Array, sampleRate = 24000): Blob {
   return new Blob([buffer], { type: "audio/wav" });
 }
 
-let browserVoicesWarned = false;
-
-function speakWithBrowserFallback(text: string) {
-  if (!("speechSynthesis" in window)) return;
-  if (!browserVoicesWarned) {
-    console.warn(
-      "Falling back to browser TTS — Gemini TTS call failed or is unavailable.",
-    );
-    browserVoicesWarned = true;
-  }
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  window.speechSynthesis.speak(utterance);
-}
-
+// Prepares the spoken audio using ONLY the fixed Gemini voice. Returns
+// null on any failure — the caller must treat null as "stay silent, text
+// only" and must NEVER fall back to the browser's speechSynthesis voice.
 async function prepareSpeech(text: string): Promise<HTMLAudioElement | null> {
   try {
     const res = await fetch(
@@ -677,7 +702,7 @@ async function prepareSpeech(text: string): Promise<HTMLAudioElement | null> {
             responseModalities: ["AUDIO"],
             speechConfig: {
               voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: "Leda" },
+                prebuiltVoiceConfig: { voiceName: TTS_VOICE_NAME },
               },
             },
           },
@@ -686,12 +711,15 @@ async function prepareSpeech(text: string): Promise<HTMLAudioElement | null> {
     );
     const json = await res.json();
     if (!res.ok) {
-      console.error("Gemini TTS error", json);
+      console.error("Gemini TTS error — staying silent (text only)", json);
       return null;
     }
     const inlineData = json.candidates?.[0]?.content?.parts?.[0]?.inlineData;
     if (!inlineData?.data) {
-      console.error("No audio returned from Gemini TTS", json);
+      console.error(
+        "No audio returned from Gemini TTS — staying silent (text only)",
+        json,
+      );
       return null;
     }
     const pcmBytes = base64ToUint8Array(inlineData.data);
@@ -701,7 +729,10 @@ async function prepareSpeech(text: string): Promise<HTMLAudioElement | null> {
     audio.onended = () => URL.revokeObjectURL(url);
     return audio;
   } catch (err) {
-    console.error("Gemini TTS request failed", err);
+    console.error(
+      "Gemini TTS request failed — staying silent (text only)",
+      err,
+    );
     return null;
   }
 }
@@ -763,7 +794,7 @@ const TELEMETRY_LINES = [
   "LATENCY .......... 42MS",
   "MEM ALLOC ........ 61%",
   "UPLINK ........... SECURE",
-  "VOICE MODEL ...... GEMMA-4",
+  "VOICE MODEL ...... GEMINI",
   "THERMAL .......... 36.4C",
   "CIPHER ........... AES-256",
   "SIGNAL ........... -62DBM",
@@ -792,21 +823,14 @@ function useTelemetryFeed(active: boolean) {
   return lines;
 }
 
-function playAndWait(
-  audio: HTMLAudioElement | null,
-  fallbackText: string,
-): Promise<void> {
+// Plays the prepared Gemini audio and waits for it to finish. If audio is
+// null (TTS failed), we resolve immediately and stay silent — there is NO
+// browser speechSynthesis fallback anywhere in this app, by design.
+function playAndWait(audio: HTMLAudioElement | null): Promise<void> {
   return new Promise((resolve) => {
     if (audio) {
       audio.onended = () => resolve();
       audio.play();
-      return;
-    }
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-      const utter = new SpeechSynthesisUtterance(fallbackText);
-      utter.onend = () => resolve();
-      window.speechSynthesis.speak(utter);
       return;
     }
     resolve();
@@ -977,6 +1001,43 @@ function App() {
     });
   }
 
+  // ---- Hands-free panel control ----
+  // These are the ONLY functions that actually change panel visibility.
+  // Both the header buttons (mouse/touch) and the open_panel/close_panel
+  // voice tool calls route through these, so behavior stays identical
+  // whether the user clicks or speaks.
+
+  // Opens exactly one panel, hiding the others that share the same slot.
+  // "history" lives in its own left-hand slot, so opening it doesn't touch
+  // the right-hand panels and vice versa — mirrors the original mouse
+  // button behavior.
+  function openPanelByName(panel: PanelName) {
+    if (panel === "history") {
+      setShowHistory(true);
+      return;
+    }
+    setShowCodeEditor(panel === "code");
+    setShowAppPreview(panel === "app");
+    setShowFileOutput(panel === "files");
+  }
+
+  // Closes one named panel, or — if no panel is named — whatever is
+  // currently open. This covers "close it" / "close that panel" during a
+  // live call without the user needing to say which one.
+  function closePanelByName(panel?: PanelName | null) {
+    if (!panel) {
+      setShowHistory(false);
+      setShowCodeEditor(false);
+      setShowAppPreview(false);
+      setShowFileOutput(false);
+      return;
+    }
+    if (panel === "history") setShowHistory(false);
+    if (panel === "code") setShowCodeEditor(false);
+    if (panel === "app") setShowAppPreview(false);
+    if (panel === "files") setShowFileOutput(false);
+  }
+
   async function sendMessage(text: string) {
     const trimmed = text.trim();
     if (!trimmed || loading) return;
@@ -1041,8 +1102,7 @@ function App() {
         // build_app is about seeing the thing run, not reading its code —
         // switch straight to the App Preview panel. This matters most on a
         // live call, where there's no mouse click to switch tabs by hand.
-        setShowCodeEditor(false);
-        setShowAppPreview(true);
+        openPanelByName("app");
         toolResultText = `Built${
           title ? ` "${title}"` : " the app"
         } — the preview is open now, and you can pop it into a new tab from there whenever you want.`;
@@ -1062,10 +1122,31 @@ function App() {
             url: URL.createObjectURL(blob),
           };
         });
-        setShowCodeEditor(false);
-        setShowAppPreview(false);
-        setShowFileOutput(true);
+        openPanelByName("files");
         toolResultText = `Made ${finalFilename} — it's ready to download or copy from the Files panel.`;
+      } else if (toolCall.name === "open_panel") {
+        const panel = normalizePanelName(toolCall.arguments?.panel);
+        if (!panel) {
+          toolResultText =
+            "I didn't catch which panel to open — try history, code, app, or files.";
+        } else {
+          openPanelByName(panel);
+          const label =
+            panel === "history"
+              ? "History"
+              : panel === "code"
+                ? "Code editor"
+                : panel === "app"
+                  ? "App preview"
+                  : "Files";
+          toolResultText = `Opened the ${label} panel for you.`;
+        }
+      } else if (toolCall.name === "close_panel") {
+        const panel = normalizePanelName(toolCall.arguments?.panel);
+        closePanelByName(panel);
+        toolResultText = panel
+          ? `Closed the ${panel} panel.`
+          : "Closed the open panel.";
       } else {
         toolResultText = await runTool(toolCall);
       }
@@ -1129,13 +1210,15 @@ function App() {
 
     // Prepare the audio BEFORE showing the reply, so the text bubble and the
     // voice appear together instead of the text sitting there silently first.
+    // If TTS fails, audio is null and playAndWait below just stays silent —
+    // there is no browser-voice fallback.
     const audio = await prepareSpeech(displayText);
 
     setMessages([...nextMessages, { role: "model", text: displayText }]);
     setLoading(false);
     setPhase("speaking");
 
-    await playAndWait(audio, displayText);
+    await playAndWait(audio);
 
     if (callActiveRef.current) {
       setPhase("listening");
@@ -1232,7 +1315,6 @@ function App() {
     setCallActive(false);
     callActiveRef.current = false;
     recognitionRef.current?.stop();
-    window.speechSynthesis?.cancel();
     setPhase("idle");
   }
 
@@ -1260,9 +1342,7 @@ function App() {
     filename: string,
   ) {
     if (streamTimerRef.current) clearInterval(streamTimerRef.current);
-    setShowCodeEditor(true);
-    setShowAppPreview(false);
-    setShowFileOutput(false);
+    openPanelByName("code");
     setIsStreamingCode(true);
     setCodeEditor({ code: "", language, filename });
 
@@ -1304,24 +1384,26 @@ function App() {
     }
   }
 
-  // Panels share the right-hand slot, so opening one closes the others
-  // rather than letting them stack and overlap.
+  // Header buttons now route through the shared open/close helpers so
+  // mouse clicks and voice commands behave identically.
+  function toggleHistory() {
+    if (showHistory) closePanelByName("history");
+    else openPanelByName("history");
+  }
+
   function toggleCodeEditor() {
-    setShowCodeEditor((v) => !v);
-    setShowAppPreview(false);
-    setShowFileOutput(false);
+    if (showCodeEditor) closePanelByName("code");
+    else openPanelByName("code");
   }
 
   function toggleAppPreview() {
-    setShowAppPreview((v) => !v);
-    setShowCodeEditor(false);
-    setShowFileOutput(false);
+    if (showAppPreview) closePanelByName("app");
+    else openPanelByName("app");
   }
 
   function toggleFileOutput() {
-    setShowFileOutput((v) => !v);
-    setShowCodeEditor(false);
-    setShowAppPreview(false);
+    if (showFileOutput) closePanelByName("files");
+    else openPanelByName("files");
   }
 
   async function copyFileContent() {
@@ -1413,7 +1495,7 @@ function App() {
             </div>
           </div>
           <button
-            onClick={() => setShowHistory((v) => !v)}
+            onClick={toggleHistory}
             className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
           >
             ☰ <span className="hidden sm:inline">History</span>
@@ -1458,7 +1540,7 @@ function App() {
                 Chat History
               </span>
               <button
-                onClick={() => setShowHistory(false)}
+                onClick={() => closePanelByName("history")}
                 className="text-[#3d6b85] hover:text-[#3ddcff] text-xs"
               >
                 ✕
@@ -1565,7 +1647,7 @@ function App() {
                 Code Editor
               </span>
               <button
-                onClick={() => setShowCodeEditor(false)}
+                onClick={() => closePanelByName("code")}
                 className="text-[#3d6b85] hover:text-[#3ddcff] text-xs"
               >
                 ✕
@@ -1653,7 +1735,7 @@ function App() {
                 App Preview
               </span>
               <button
-                onClick={() => setShowAppPreview(false)}
+                onClick={() => closePanelByName("app")}
                 className="text-[#3d6b85] hover:text-[#3ddcff] text-xs"
               >
                 ✕
@@ -1721,7 +1803,7 @@ function App() {
                 Files
               </span>
               <button
-                onClick={() => setShowFileOutput(false)}
+                onClick={() => closePanelByName("files")}
                 className="text-[#3d6b85] hover:text-[#3ddcff] text-xs"
               >
                 ✕
