@@ -8,17 +8,119 @@ const GEMMA_API_KEY = import.meta.env.VITE_GEMMA_API_KEY;
 // faster/cheaper one if the previous call fails for any reason (quota
 // exhausted, rate limited, network error, 5xx, etc). This means a live
 // call never just dies because one model ran out of tokens.
-const THINKING_MODEL_CHAIN = [
+//
+// These are PREFERRED ORDERS, not guarantees — free-tier model
+// availability shifts by account/region, so at runtime we intersect these
+// with whatever your actual API key reports access to (see
+// getAvailableModelIds below) rather than blindly trusting hardcoded names.
+const THINKING_MODEL_CHAIN_PREFERRED = [
   "gemini-2.5-pro", // best thinking — tried first
+  "gemini-3-pro",
   "gemini-2.5-flash", // fastest — first fallback
+  "gemini-3-flash",
+  "gemini-2.0-flash",
   "gemini-2.5-flash-lite", // last-resort fallback
+  "gemini-3.1-flash-lite",
+  "gemini-2.0-flash-lite",
+  "gemini-1.5-flash",
 ];
 // Lighter-weight chain for cheap background tasks (transcript cleanup,
 // history summarization) where we don't need the heaviest model first.
-const FAST_MODEL_CHAIN = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
+const FAST_MODEL_CHAIN_PREFERRED = [
+  "gemini-2.5-flash",
+  "gemini-3-flash",
+  "gemini-2.0-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-3.1-flash-lite",
+  "gemini-2.0-flash-lite",
+  "gemini-1.5-flash",
+];
 // Research needs Google Search grounding, which not every model supports
 // well — keep its own chain.
-const RESEARCH_MODEL_CHAIN = ["gemini-2.5-pro", "gemini-2.5-flash"];
+const RESEARCH_MODEL_CHAIN_PREFERRED = [
+  "gemini-2.5-pro",
+  "gemini-3-pro",
+  "gemini-2.5-flash",
+  "gemini-3-flash",
+  "gemini-2.0-flash",
+];
+
+// ---- Runtime model discovery ----
+// Free-tier model availability changes by account/region and Google adds
+// or retires model IDs fairly often, so instead of trusting the hardcoded
+// preferred-order lists blindly, we ask the API once per page load which
+// models THIS key can actually call, and filter our preferred lists down
+// to only those. If the discovery call itself fails (network, key issue),
+// we fall back to trying the hardcoded preferred lists as-is, so the app
+// still works even if this lookup can't run.
+let availableModelIdsCache: string[] | null = null;
+let availableModelIdsPromise: Promise<string[]> | null = null;
+
+async function getAvailableModelIds(): Promise<string[]> {
+  if (availableModelIdsCache) return availableModelIdsCache;
+  if (availableModelIdsPromise) return availableModelIdsPromise;
+
+  availableModelIdsPromise = (async () => {
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models?key=${GEMMA_API_KEY}&pageSize=200`,
+      );
+      const json = await res.json();
+      if (!res.ok) {
+        console.warn(
+          "Couldn't list available models — falling back to hardcoded preferred model names.",
+          json,
+        );
+        return [];
+      }
+      const ids: string[] = (json.models ?? [])
+        .filter((m: any) =>
+          (m.supportedGenerationMethods ?? []).includes("generateContent"),
+        )
+        .map((m: any) => String(m.name ?? "").replace(/^models\//, ""))
+        .filter(Boolean);
+      console.log("Models available to this API key:", ids);
+      availableModelIdsCache = ids;
+      return ids;
+    } catch (err) {
+      console.warn(
+        "Model discovery request failed — falling back to hardcoded preferred model names.",
+        err,
+      );
+      return [];
+    }
+  })();
+
+  return availableModelIdsPromise;
+}
+
+// Builds the actual chain to use for a call: intersects the preferred
+// order with what's really available, so we never waste a call on a model
+// name your key doesn't have (like the 404 you hit on flash-lite). If
+// discovery came back empty (it failed, or genuinely returned nothing), we
+// just use the preferred list as originally written rather than blocking.
+async function resolveModelChain(preferred: string[]): Promise<string[]> {
+  const available = await getAvailableModelIds();
+  if (available.length === 0) return preferred;
+  const filtered = preferred.filter((m) => available.includes(m));
+  return filtered.length > 0 ? filtered : preferred;
+}
+
+// Per-model cooldown after a 429, so a live call in a tight loop doesn't
+// keep re-hitting a model we already know is rate-limited this minute —
+// it skips straight to the next model in the chain until the cooldown
+// clears. Cooldown is intentionally short (matches typical free-tier RPM
+// windows) rather than trying to parse each model's exact reset time.
+const RATE_LIMIT_COOLDOWN_MS = 20_000;
+const rateLimitedUntil: Record<string, number> = {};
+
+function isOnCooldown(model: string): boolean {
+  return (rateLimitedUntil[model] ?? 0) > Date.now();
+}
+
+function markRateLimited(model: string) {
+  rateLimitedUntil[model] = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+}
 
 const TTS_MODEL = "gemini-2.5-flash-preview-tts";
 // The ONLY voice this app is allowed to speak in. There is no other voice
@@ -200,10 +302,20 @@ function extractFinalAnswer(json: GeminiResponse): string {
 // the top model never kills the conversation. Returns null only if every
 // model in the chain failed.
 async function callGeminiWithFallback(
-  models: string[],
+  preferredModels: string[],
   payload: Record<string, any>,
 ): Promise<GeminiResponse | null> {
+  const models = await resolveModelChain(preferredModels);
+  let sawAnyAttempt = false;
+
   for (const model of models) {
+    if (isOnCooldown(model)) {
+      console.log(
+        `Skipping "${model}" — still on cooldown from a recent rate limit.`,
+      );
+      continue;
+    }
+    sawAnyAttempt = true;
     try {
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -218,7 +330,20 @@ async function callGeminiWithFallback(
       );
       const json = await res.json();
       if (!res.ok) {
-        console.warn(`Model "${model}" returned an error, falling back:`, json);
+        if (res.status === 429) {
+          markRateLimited(model);
+          console.warn(
+            `Model "${model}" is rate-limited (429) — cooling down for ${
+              RATE_LIMIT_COOLDOWN_MS / 1000
+            }s and falling back:`,
+            json,
+          );
+        } else {
+          console.warn(
+            `Model "${model}" returned an error, falling back:`,
+            json,
+          );
+        }
         continue;
       }
       return json as GeminiResponse;
@@ -227,7 +352,15 @@ async function callGeminiWithFallback(
       continue;
     }
   }
-  console.error("All models in fallback chain failed:", models);
+
+  if (!sawAnyAttempt) {
+    console.error(
+      "Every model in the chain is on cooldown from recent rate limits:",
+      models,
+    );
+  } else {
+    console.error("All models in fallback chain failed:", models);
+  }
   return null;
 }
 
@@ -308,7 +441,7 @@ async function researchIdea(args: Record<string, any>): Promise<string> {
   if (!idea || !String(idea).trim()) return "No idea given to research.";
 
   try {
-    const json = await callGeminiWithFallback(RESEARCH_MODEL_CHAIN, {
+    const json = await callGeminiWithFallback(RESEARCH_MODEL_CHAIN_PREFERRED, {
       contents: [
         {
           role: "user",
@@ -531,7 +664,7 @@ async function refineTranscript(raw: string): Promise<string> {
   const trimmed = raw.trim();
   if (!trimmed) return raw;
   try {
-    const json = await callGeminiWithFallback(FAST_MODEL_CHAIN, {
+    const json = await callGeminiWithFallback(FAST_MODEL_CHAIN_PREFERRED, {
       system_instruction: {
         parts: [
           {
@@ -557,7 +690,7 @@ async function askEngineer(
   conversationSummary?: string,
   teacherMode?: boolean,
 ): Promise<string> {
-  const json = await callGeminiWithFallback(THINKING_MODEL_CHAIN, {
+  const json = await callGeminiWithFallback(THINKING_MODEL_CHAIN_PREFERRED, {
     system_instruction: {
       parts: [
         {
@@ -604,7 +737,7 @@ async function condenseHistory(
     .join("\n");
 
   try {
-    const json = await callGeminiWithFallback(FAST_MODEL_CHAIN, {
+    const json = await callGeminiWithFallback(FAST_MODEL_CHAIN_PREFERRED, {
       system_instruction: {
         parts: [
           {
@@ -824,16 +957,39 @@ function useTelemetryFeed(active: boolean) {
 }
 
 // Plays the prepared Gemini audio and waits for it to finish. If audio is
-// null (TTS failed), we resolve immediately and stay silent — there is NO
-// browser speechSynthesis fallback anywhere in this app, by design.
+// null (TTS failed upstream), we resolve immediately and stay silent — there
+// is NO browser speechSynthesis fallback anywhere in this app, by design.
+//
+// IMPORTANT: audio.play() returns a promise that browsers can REJECT if the
+// call isn't tied closely enough to a direct user gesture (autoplay
+// policy) — this is especially likely in the live-call loop, where
+// playback fires after several `await`s. If that rejection isn't caught,
+// nothing plays AND nothing errors visibly — it just looks like total
+// silence. We catch it here and log it so a blocked-autoplay case is
+// distinguishable from an actual TTS failure.
 function playAndWait(audio: HTMLAudioElement | null): Promise<void> {
   return new Promise((resolve) => {
-    if (audio) {
-      audio.onended = () => resolve();
-      audio.play();
+    if (!audio) {
+      console.warn("playAndWait: no audio to play (TTS returned null).");
+      resolve();
       return;
     }
-    resolve();
+    audio.onended = () => resolve();
+    audio.onerror = (e) => {
+      console.error("Audio element error during playback:", e);
+      resolve();
+    };
+    const playPromise = audio.play();
+    if (playPromise && typeof playPromise.catch === "function") {
+      playPromise.catch((err) => {
+        console.error(
+          "audio.play() was rejected — likely blocked by the browser's autoplay policy. " +
+            "Click anywhere on the page once, or interact with the Talk button first, then try again.",
+          err,
+        );
+        resolve();
+      });
+    }
   });
 }
 
