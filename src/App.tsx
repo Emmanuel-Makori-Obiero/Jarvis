@@ -85,7 +85,7 @@ function buildSystemInstruction(
     "You are given the FULL conversation history on every turn, including everything said earlier in this call or chat. Actually use it: remember names, numbers, decisions, and anything the user told you earlier in this same session, and refer back to them naturally when relevant. Never ask the user to repeat something they already told you earlier in this conversation — check the history first.",
     "When walking someone through a multi-step task (like programming or debugging), give ONE step at a time, keep it short, then explicitly ask something like 'let me know once you've done that' before moving to the next step. Never dump several steps at once during a live call.",
     "",
-    "You have seven tools you can call:",
+    "You have eight tools you can call:",
     '1. manage_tasks(action: "add"|"list"|"complete"|"delete", title?: string, task_id?: string) — reads/writes the user\'s task list.',
     "2. research_idea(idea: string) — runs a real web search on a business idea, opens the top source in a new browser tab, and returns a short brief with citations.",
     "3. remember(fact: string) — saves a short, durable fact about the user (their name, preferences, ongoing projects, recurring context) so you can recall it in future conversations, even new ones. Call this whenever the user shares something worth remembering long-term. Do not call it for one-off details that only matter for this exchange.",
@@ -93,6 +93,7 @@ function buildSystemInstruction(
     "5. close_link(target?: string) — closes a tab that was previously opened with open_link. If the user just says 'close it', 'close that', or 'close the tab', call this with no target and it closes the most recently opened one. If the user names which site (e.g. 'close the Wikipedia one'), pass that name or word as target so the right tab closes even if more than one is open.",
     "6. write_code(code: string, language?: string, filename?: string) — puts code into the on-screen code editor panel instead of speaking it. Use this whenever the user asks you to write, generate, debug, fix, or add a feature to code, or when they paste code and ask for changes. Always return the FULL updated code in the code argument, not just a snippet or diff.",
     "7. build_app(html: string, title?: string) — use this whenever the user asks you to build them an app, a website, a tool, or anything they want to actually see running and interact with (not just a code snippet). The html argument must be ONE complete, self-contained HTML document starting with <!DOCTYPE html>, with all CSS in a <style> tag and all JS in a <script> tag inline — no external files, no build step, no import statements. Keep it fully working with no placeholders. This opens a live preview and a link the user can open in a new tab.",
+    "8. make_file(content: string, filename?: string) — use this whenever the user asks you to write something they clearly want as a downloadable file rather than a spoken reply or code to run: a document, a report, a letter, notes, a CSV, a list, a plain text or markdown file, etc. Give the filename a sensible extension (e.g. notes.md, data.csv, letter.txt) so it downloads as the right file type. Always return the FULL file content, not a partial draft. This opens a panel with a download link and a copy button.",
     "When the user's request needs one of these, respond with ONLY strict JSON and nothing else, no markdown fences: ",
     '{"tool_call": {"name": "manage_tasks", "arguments": {"action": "add", "title": "..."}}}',
     "or",
@@ -107,6 +108,8 @@ function buildSystemInstruction(
     '{"tool_call": {"name": "write_code", "arguments": {"code": "...", "language": "...", "filename": "..."}}}',
     "or",
     '{"tool_call": {"name": "build_app", "arguments": {"html": "<!DOCTYPE html>...", "title": "..."}}}',
+    "or",
+    '{"tool_call": {"name": "make_file", "arguments": {"content": "...", "filename": "notes.md"}}}',
     "Otherwise just respond normally in plain conversational text. Never read code out loud or paste large code blocks into a normal spoken reply — always use write_code or build_app for that and just briefly describe what you changed.",
     "If the user asks you to explain code (e.g. 'explain this' or 'walk me through every line'), do NOT call write_code and do NOT wrap anything in triple-backtick code fences — just explain it in plain conversational prose, referencing lines by what they do rather than quoting them verbatim, going through it in order from top to bottom.",
   ];
@@ -168,7 +171,8 @@ interface ToolCall {
     | "open_link"
     | "close_link"
     | "write_code"
-    | "build_app";
+    | "build_app"
+    | "make_file";
   arguments: Record<string, any>;
 }
 
@@ -302,6 +306,29 @@ async function researchIdea(args: Record<string, any>): Promise<string> {
   }
 }
 
+// Picks a reasonable MIME type from a filename's extension so the
+// downloaded file opens/saves sensibly instead of always being a generic
+// text file.
+function mimeTypeForFilename(filename: string): string {
+  const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+  const map: Record<string, string> = {
+    txt: "text/plain",
+    md: "text/markdown",
+    csv: "text/csv",
+    json: "application/json",
+    html: "text/html",
+    css: "text/css",
+    js: "text/javascript",
+    ts: "text/plain",
+    py: "text/x-python",
+    xml: "application/xml",
+    yaml: "text/yaml",
+    yml: "text/yaml",
+    svg: "image/svg+xml",
+  };
+  return map[ext] ?? "text/plain";
+}
+
 // Tracks tabs opened via open_link so close_link can close them again later.
 // window.open() only returns a handle we can call .close() on when we OMIT
 // noopener — with noopener set, browsers always return null, which is why
@@ -414,8 +441,9 @@ async function runTool(call: ToolCall): Promise<string> {
   if (call.name === "remember") return rememberFact(call.arguments);
   if (call.name === "open_link") return openLink(call.arguments);
   if (call.name === "close_link") return closeLink(call.arguments);
-  // write_code is intercepted in sendMessage before runTool is called,
-  // since it needs to update the code editor's React state.
+  // write_code, build_app, and make_file are intercepted in sendMessage
+  // before runTool is called, since they need to update React state
+  // (editor panel, app preview, or file output panel) directly.
   return "Unknown tool.";
 }
 
@@ -828,6 +856,13 @@ function App() {
     url: string;
   }>({ html: "", title: "", url: "" });
   const [showAppPreview, setShowAppPreview] = useState(false);
+  const [showFileOutput, setShowFileOutput] = useState(false);
+  const [fileOutput, setFileOutput] = useState<{
+    content: string;
+    filename: string;
+    url: string;
+  }>({ content: "", filename: "", url: "" });
+  const [copyFileLabel, setCopyFileLabel] = useState("Copy");
   const [appLinkLabel, setAppLinkLabel] = useState("Copy link");
   const [isStreamingCode, setIsStreamingCode] = useState(false);
   const streamTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1011,6 +1046,26 @@ function App() {
         toolResultText = `Built${
           title ? ` "${title}"` : " the app"
         } — the preview is open now, and you can pop it into a new tab from there whenever you want.`;
+      } else if (toolCall.name === "make_file") {
+        setPhase("coding");
+        const { content, filename } = toolCall.arguments;
+        const contentStr = String(content ?? "");
+        const finalFilename = filename ? String(filename) : "file.txt";
+        setFileOutput((prev) => {
+          if (prev.url) URL.revokeObjectURL(prev.url);
+          const blob = new Blob([contentStr], {
+            type: mimeTypeForFilename(finalFilename),
+          });
+          return {
+            content: contentStr,
+            filename: finalFilename,
+            url: URL.createObjectURL(blob),
+          };
+        });
+        setShowCodeEditor(false);
+        setShowAppPreview(false);
+        setShowFileOutput(true);
+        toolResultText = `Made ${finalFilename} — it's ready to download or copy from the Files panel.`;
       } else {
         toolResultText = await runTool(toolCall);
       }
@@ -1206,6 +1261,8 @@ function App() {
   ) {
     if (streamTimerRef.current) clearInterval(streamTimerRef.current);
     setShowCodeEditor(true);
+    setShowAppPreview(false);
+    setShowFileOutput(false);
     setIsStreamingCode(true);
     setCodeEditor({ code: "", language, filename });
 
@@ -1247,16 +1304,35 @@ function App() {
     }
   }
 
-  // Panels share the right-hand slot, so opening one closes the other
+  // Panels share the right-hand slot, so opening one closes the others
   // rather than letting them stack and overlap.
   function toggleCodeEditor() {
     setShowCodeEditor((v) => !v);
     setShowAppPreview(false);
+    setShowFileOutput(false);
   }
 
   function toggleAppPreview() {
     setShowAppPreview((v) => !v);
     setShowCodeEditor(false);
+    setShowFileOutput(false);
+  }
+
+  function toggleFileOutput() {
+    setShowFileOutput((v) => !v);
+    setShowCodeEditor(false);
+    setShowAppPreview(false);
+  }
+
+  async function copyFileContent() {
+    try {
+      await navigator.clipboard.writeText(fileOutput.content);
+      setCopyFileLabel("Copied!");
+    } catch {
+      setCopyFileLabel("Copy failed");
+    } finally {
+      setTimeout(() => setCopyFileLabel("Copy"), 1500);
+    }
   }
 
   // Sends the current editor code back to Jarvis asking for a plain-language,
@@ -1353,6 +1429,12 @@ function App() {
             className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
           >
             ▶ <span className="hidden sm:inline">App</span>
+          </button>
+          <button
+            onClick={toggleFileOutput}
+            className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
+          >
+            ⬇ <span className="hidden sm:inline">Files</span>
           </button>
           <button
             onClick={callActive ? endCall : startCall}
@@ -1627,6 +1709,59 @@ function App() {
               it's a local preview, not a hosted public URL. Reloading the page
               or closing the tab will invalidate it; use "Open in new tab" or
               copy the code to deploy it somewhere permanent.
+            </p>
+          </div>
+        )}
+
+        {/* file output panel */}
+        {showFileOutput && (
+          <div className="absolute inset-y-0 right-0 w-full sm:w-[26rem] z-30 bg-[#03060a]/95 border-l border-[#123047] backdrop-blur-sm flex flex-col p-4 gap-3 overflow-y-auto">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[10px] tracking-[0.3em] text-[#3d6b85] uppercase">
+                Files
+              </span>
+              <button
+                onClick={() => setShowFileOutput(false)}
+                className="text-[#3d6b85] hover:text-[#3ddcff] text-xs"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="border border-[#123047] bg-[#0a0f14] flex flex-col min-h-[12rem]">
+              <div className="flex items-center justify-between px-3 py-2 border-b border-[#123047] text-[9px] uppercase tracking-widest text-[#3d6b85]">
+                <span className="truncate">
+                  {fileOutput.filename || "no file yet"}
+                </span>
+                <div className="flex items-center gap-3 shrink-0">
+                  <a
+                    href={fileOutput.url || undefined}
+                    download={fileOutput.filename || undefined}
+                    className={`text-[#3ddcff] hover:text-[#8fe3ff] tracking-widest ${
+                      !fileOutput.url ? "opacity-30 pointer-events-none" : ""
+                    }`}
+                  >
+                    Download
+                  </a>
+                  <button
+                    onClick={copyFileContent}
+                    disabled={!fileOutput.content}
+                    className="text-[#3ddcff] hover:text-[#8fe3ff] disabled:opacity-30 disabled:hover:text-[#3ddcff] tracking-widest"
+                  >
+                    {copyFileLabel}
+                  </button>
+                </div>
+              </div>
+              <pre className="flex-1 overflow-auto p-3 text-[11px] leading-relaxed text-[#c9e8f7] whitespace-pre-wrap break-words">
+                {fileOutput.content ||
+                  "Ask Jarvis to write you a file — a document, notes, a CSV, anything downloadable — and it'll show up here."}
+              </pre>
+            </div>
+
+            <p className="text-[9px] text-[#3d6b85] leading-relaxed">
+              Download saves it straight to your device. Copy puts the raw
+              content on your clipboard to paste anywhere. Like the other
+              panels, this link only lives for this browser session.
             </p>
           </div>
         )}
