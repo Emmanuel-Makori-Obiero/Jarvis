@@ -14,14 +14,18 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 const CONV_STORAGE_KEY = "jarvis_conversations";
 const MEMORY_STORAGE_KEY = "jarvis_memory";
+const TEACHER_MODE_STORAGE_KEY = "jarvis_teacher_mode";
 
 // Keep this many of the most recent messages verbatim in every API call;
 // anything older than that gets folded into a running summary instead of
 // being dropped, so the assistant doesn't lose context in long sessions.
-const RECENT_MESSAGE_LIMIT = 300;
+// gemma-4-26b-a4b-it has a 128K-256K token context window, so this can be
+// pushed high — most calls/chats will never even approach this and will
+// always send the full raw history, never a lossy summary.
+const RECENT_MESSAGE_LIMIT = 2000;
 // Only re-summarize once the raw history grows this far past the recent
 // window, so we're not re-summarizing on every single turn.
-const SUMMARIZE_TRIGGER = RECENT_MESSAGE_LIMIT + 50;
+const SUMMARIZE_TRIGGER = RECENT_MESSAGE_LIMIT + 100;
 
 type Role = "user" | "model";
 interface Message {
@@ -71,21 +75,24 @@ function titleFromMessages(messages: Message[]): string {
 function buildSystemInstruction(
   memoryFacts: string[],
   conversationSummary?: string,
+  teacherMode?: boolean,
 ): string {
   const lines = [
     "You are Engineer, a helpful personal voice assistant.",
     "Keep replies short and conversational, like a real spoken response — usually 1-3 sentences unless the user clearly wants more detail.",
     "Never use markdown, bullet points, or numbered lists in your replies, since they will be read aloud.",
     "Match the language the user is using. If they write in English, reply in English. If they write in Kiswahili, reply in Kiswahili. If they mix English and Kiswahili (Sheng or everyday code-switching), reply naturally in that same mixed, conversational style — do not force pure formal Kiswahili unless the user is doing that themselves.",
+    "You are given the FULL conversation history on every turn, including everything said earlier in this call or chat. Actually use it: remember names, numbers, decisions, and anything the user told you earlier in this same session, and refer back to them naturally when relevant. Never ask the user to repeat something they already told you earlier in this conversation — check the history first.",
     "When walking someone through a multi-step task (like programming or debugging), give ONE step at a time, keep it short, then explicitly ask something like 'let me know once you've done that' before moving to the next step. Never dump several steps at once during a live call.",
     "",
-    "You have six tools you can call:",
+    "You have seven tools you can call:",
     '1. manage_tasks(action: "add"|"list"|"complete"|"delete", title?: string, task_id?: string) — reads/writes the user\'s task list.',
     "2. research_idea(idea: string) — runs a real web search on a business idea, opens the top source in a new browser tab, and returns a short brief with citations.",
     "3. remember(fact: string) — saves a short, durable fact about the user (their name, preferences, ongoing projects, recurring context) so you can recall it in future conversations, even new ones. Call this whenever the user shares something worth remembering long-term. Do not call it for one-off details that only matter for this exchange.",
-    "4. open_link(url: string, title?: string) — opens a specific URL in a new browser tab. Use this whenever the user asks you to open a link, a website, or a page they name or that came up earlier in the conversation.",
-    "5. write_code(code: string, language?: string, filename?: string) — puts code into the on-screen code editor panel instead of speaking it. Use this whenever the user asks you to write, generate, debug, fix, or add a feature to code, or when they paste code and ask for changes. Always return the FULL updated code in the code argument, not just a snippet or diff.",
-    "6. build_app(html: string, title?: string) — use this whenever the user asks you to build them an app, a website, a tool, or anything they want to actually see running and interact with (not just a code snippet). The html argument must be ONE complete, self-contained HTML document starting with <!DOCTYPE html>, with all CSS in a <style> tag and all JS in a <script> tag inline — no external files, no build step, no import statements. Keep it fully working with no placeholders. This opens a live preview and a link the user can open in a new tab.",
+    "4. open_link(url: string, title?: string) — opens a specific URL in a new browser tab. Use this whenever the user asks you to open a link, a website, or a page they name or that came up earlier in the conversation, including 'tell me about this site' style requests where opening it helps.",
+    "5. close_link(target?: string) — closes a tab that was previously opened with open_link. If the user just says 'close it', 'close that', or 'close the tab', call this with no target and it closes the most recently opened one. If the user names which site (e.g. 'close the Wikipedia one'), pass that name or word as target so the right tab closes even if more than one is open.",
+    "6. write_code(code: string, language?: string, filename?: string) — puts code into the on-screen code editor panel instead of speaking it. Use this whenever the user asks you to write, generate, debug, fix, or add a feature to code, or when they paste code and ask for changes. Always return the FULL updated code in the code argument, not just a snippet or diff.",
+    "7. build_app(html: string, title?: string) — use this whenever the user asks you to build them an app, a website, a tool, or anything they want to actually see running and interact with (not just a code snippet). The html argument must be ONE complete, self-contained HTML document starting with <!DOCTYPE html>, with all CSS in a <style> tag and all JS in a <script> tag inline — no external files, no build step, no import statements. Keep it fully working with no placeholders. This opens a live preview and a link the user can open in a new tab.",
     "When the user's request needs one of these, respond with ONLY strict JSON and nothing else, no markdown fences: ",
     '{"tool_call": {"name": "manage_tasks", "arguments": {"action": "add", "title": "..."}}}',
     "or",
@@ -95,12 +102,24 @@ function buildSystemInstruction(
     "or",
     '{"tool_call": {"name": "open_link", "arguments": {"url": "...", "title": "..."}}}',
     "or",
+    '{"tool_call": {"name": "close_link", "arguments": {"target": "..."}}}',
+    "or",
     '{"tool_call": {"name": "write_code", "arguments": {"code": "...", "language": "...", "filename": "..."}}}',
     "or",
     '{"tool_call": {"name": "build_app", "arguments": {"html": "<!DOCTYPE html>...", "title": "..."}}}',
     "Otherwise just respond normally in plain conversational text. Never read code out loud or paste large code blocks into a normal spoken reply — always use write_code or build_app for that and just briefly describe what you changed.",
     "If the user asks you to explain code (e.g. 'explain this' or 'walk me through every line'), do NOT call write_code and do NOT wrap anything in triple-backtick code fences — just explain it in plain conversational prose, referencing lines by what they do rather than quoting them verbatim, going through it in order from top to bottom.",
   ];
+  if (teacherMode) {
+    lines.push(
+      "",
+      "TEACHING MODE (currently ON): You are not here to hand over answers. When the user asks a question that has a real thinking step involved (reasoning, math, debugging, decisions, explanations of 'why' or 'how'), do not answer it directly on the first pass. Instead respond like a good teacher: ask ONE short, sharp question that pushes the user to think it through themselves — e.g. what they already know, what they'd guess and why, or what the first step might be. Keep it to a single sentence or two, since this is spoken/read aloud.",
+      "If the user answers and is on the right track, confirm briefly and ask the next probing question to push them further, rather than confirming and then dumping the full answer.",
+      "If the user answers and is wrong or stuck, don't just correct them — point at the specific gap or flawed assumption in their reasoning and ask them to try again from there.",
+      "Only give the direct answer outright if: the user explicitly asks you to just tell them (e.g. 'just give me the answer', 'stop quizzing me'), the question is a simple factual lookup with no reasoning involved (e.g. a date, a definition, a phone number), or the user has genuinely tried multiple times and is stuck — and even then, give the answer plus a one-line explanation of the reasoning so it still teaches something.",
+      "Don't be a smug quiz show host about this — stay warm and encouraging, like a teacher who respects the user's intelligence and wants them to earn the insight, not one who's withholding to be difficult.",
+    );
+  }
   if (memoryFacts.length > 0) {
     lines.push(
       "",
@@ -147,6 +166,7 @@ interface ToolCall {
     | "research_idea"
     | "remember"
     | "open_link"
+    | "close_link"
     | "write_code"
     | "build_app";
   arguments: Record<string, any>;
@@ -282,6 +302,17 @@ async function researchIdea(args: Record<string, any>): Promise<string> {
   }
 }
 
+// Tracks tabs opened via open_link so close_link can close them again later.
+// window.open() only returns a handle we can call .close() on when we OMIT
+// noopener — with noopener set, browsers always return null, which is why
+// closing previously-opened tabs wasn't possible before.
+interface OpenTab {
+  win: Window;
+  url: string;
+  title: string;
+}
+const openTabs: OpenTab[] = [];
+
 // Opens a specific URL the user (or the model) names. Same popup-blocker
 // caveat as above applies when this runs off a voice turn rather than a
 // direct click.
@@ -289,14 +320,61 @@ async function openLink(args: Record<string, any>): Promise<string> {
   const { url, title } = args;
   if (!url || !String(url).trim()) return "No URL given to open.";
   try {
-    const win = window.open(url, "_blank", "noopener,noreferrer");
+    // noreferrer only (no noopener) so we keep a closable handle.
+    const win = window.open(url, "_blank", "noreferrer");
     if (!win) {
       return `Tried to open ${title || url}, but the browser blocked the popup — you may need to allow popups for this site.`;
     }
+    openTabs.push({
+      win,
+      url: String(url),
+      title: title ? String(title) : String(url),
+    });
     return `Opened ${title || url} in a new tab.`;
   } catch (err) {
     console.error("open_link failed", err);
     return `Couldn't open ${url}.`;
+  }
+}
+
+// Closes a tab previously opened with open_link. If `target` is given (a
+// word from the site's title or URL), closes the most recent match;
+// otherwise closes the most recently opened tab still open.
+async function closeLink(args: Record<string, any>): Promise<string> {
+  const { target } = args;
+  // Drop anything the user already closed by hand so we don't try to close
+  // stale/closed handles or match against them.
+  for (let i = openTabs.length - 1; i >= 0; i--) {
+    if (openTabs[i].win.closed) openTabs.splice(i, 1);
+  }
+  if (openTabs.length === 0) {
+    return "There's no tab I opened that's still open.";
+  }
+
+  let index = openTabs.length - 1;
+  if (target && String(target).trim()) {
+    const needle = String(target).trim().toLowerCase();
+    const found = openTabs
+      .map((t, i) => ({ t, i }))
+      .reverse()
+      .find(
+        ({ t }) =>
+          t.title.toLowerCase().includes(needle) ||
+          t.url.toLowerCase().includes(needle),
+      );
+    if (!found) {
+      return `I couldn't find an open tab matching "${target}".`;
+    }
+    index = found.i;
+  }
+
+  const [tab] = openTabs.splice(index, 1);
+  try {
+    tab.win.close();
+    return `Closed ${tab.title}.`;
+  } catch (err) {
+    console.error("close_link failed", err);
+    return `Couldn't close ${tab.title} — some browsers block scripts from closing tabs they didn't open in this exact way.`;
   }
 }
 
@@ -335,6 +413,7 @@ async function runTool(call: ToolCall): Promise<string> {
   if (call.name === "research_idea") return researchIdea(call.arguments);
   if (call.name === "remember") return rememberFact(call.arguments);
   if (call.name === "open_link") return openLink(call.arguments);
+  if (call.name === "close_link") return closeLink(call.arguments);
   // write_code is intercepted in sendMessage before runTool is called,
   // since it needs to update the code editor's React state.
   return "Unknown tool.";
@@ -387,6 +466,7 @@ async function askEngineer(
   history: Message[],
   memoryFacts: string[],
   conversationSummary?: string,
+  teacherMode?: boolean,
 ): Promise<string> {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent`,
@@ -399,7 +479,13 @@ async function askEngineer(
       body: JSON.stringify({
         system_instruction: {
           parts: [
-            { text: buildSystemInstruction(memoryFacts, conversationSummary) },
+            {
+              text: buildSystemInstruction(
+                memoryFacts,
+                conversationSummary,
+                teacherMode,
+              ),
+            },
           ],
         },
         contents: history.map((m) => ({
@@ -718,6 +804,12 @@ function App() {
     return convos[0]?.summary ?? "";
   });
   const [memoryFacts, setMemoryFacts] = useState<string[]>(() => loadMemory());
+  const [teacherMode, setTeacherMode] = useState<boolean>(() => {
+    return localStorage.getItem(TEACHER_MODE_STORAGE_KEY) === "true";
+  });
+  useEffect(() => {
+    localStorage.setItem(TEACHER_MODE_STORAGE_KEY, String(teacherMode));
+  }, [teacherMode]);
   const [showHistory, setShowHistory] = useState(false);
 
   const [codeEditor, setCodeEditor] = useState<{
@@ -872,7 +964,12 @@ function App() {
     );
     if (summary !== conversationSummary) setConversationSummary(summary);
 
-    let reply = await askEngineer(apiMessages, memoryFacts, summary);
+    let reply = await askEngineer(
+      apiMessages,
+      memoryFacts,
+      summary,
+      teacherMode,
+    );
     const toolCall = tryParseToolCall(reply);
     let effectiveMemory = memoryFacts;
 
@@ -906,9 +1003,14 @@ function App() {
           };
         });
         revealCodeInEditor(htmlStr, "html", title ? String(title) : "app.html");
-        toolResultText = `Put the code for${
+        // build_app is about seeing the thing run, not reading its code —
+        // switch straight to the App Preview panel. This matters most on a
+        // live call, where there's no mouse click to switch tabs by hand.
+        setShowCodeEditor(false);
+        setShowAppPreview(true);
+        toolResultText = `Built${
           title ? ` "${title}"` : " the app"
-        } in the editor panel — open the App tab whenever you want to preview it or open it in a new tab.`;
+        } — the preview is open now, and you can pop it into a new tab from there whenever you want.`;
       } else {
         toolResultText = await runTool(toolCall);
       }
@@ -931,7 +1033,12 @@ function App() {
           text: `Tool result: ${toolResultText}. Reply to the user conversationally based on this, do not mention tools or JSON. Do not repeat any code in this reply.`,
         },
       ];
-      reply = await askEngineer(withToolContext, effectiveMemory, summary);
+      reply = await askEngineer(
+        withToolContext,
+        effectiveMemory,
+        summary,
+        teacherMode,
+      );
     }
 
     // If the model ignored the tools and just dropped a fenced code block
@@ -1306,6 +1413,37 @@ function App() {
                   </button>
                 </div>
               ))}
+            </div>
+
+            <div className="mt-4 pt-3 border-t border-[#123047]">
+              <button
+                onClick={() => setTeacherMode((prev) => !prev)}
+                className="w-full flex items-center justify-between px-1"
+              >
+                <span className="text-[10px] tracking-[0.3em] text-[#3d6b85] uppercase">
+                  Teacher Mode
+                </span>
+                <span
+                  className={`relative inline-flex h-4 w-8 items-center border transition-colors ${
+                    teacherMode
+                      ? "border-[#3ddcff] bg-[#3ddcff]/20"
+                      : "border-[#123047] bg-transparent"
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-2.5 w-2.5 transform transition-transform ${
+                      teacherMode
+                        ? "translate-x-4 bg-[#3ddcff]"
+                        : "translate-x-1 bg-[#3d6b85]"
+                    }`}
+                  />
+                </span>
+              </button>
+              <p className="mt-1 text-[10px] text-[#3d6b85] leading-tight">
+                {teacherMode
+                  ? "Engineer will quiz you instead of answering directly."
+                  : "Off — Engineer answers directly."}
+              </p>
             </div>
 
             <div className="mt-4 pt-3 border-t border-[#123047]">
