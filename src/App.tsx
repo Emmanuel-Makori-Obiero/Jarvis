@@ -154,7 +154,7 @@ interface Message {
 }
 
 // The four side panels the assistant can open/close hands-free by voice.
-type PanelName = "history" | "code" | "app" | "files";
+type PanelName = "history" | "code" | "app" | "files" | "browser";
 
 interface Conversation {
   id: string;
@@ -212,13 +212,13 @@ function buildSystemInstruction(
     '1. manage_tasks(action: "add"|"list"|"complete"|"delete", title?: string, task_id?: string) — reads/writes the user\'s task list.',
     "2. research_idea(idea: string) — runs a real web search on a business idea, opens the top source in a new browser tab, and returns a short brief with citations.",
     "3. remember(fact: string) — saves a short, durable fact about the user (their name, preferences, ongoing projects, recurring context) so you can recall it in future conversations, even new ones. Call this whenever the user shares something worth remembering long-term. Do not call it for one-off details that only matter for this exchange.",
-    "4. open_link(url: string, title?: string) — opens a specific URL in a new browser tab. Use this whenever the user asks you to open a link, a website, or a page they name or that came up earlier in the conversation, including 'tell me about this site' style requests where opening it helps.",
-    "5. close_link(target?: string) — closes a tab that was previously opened with open_link. If the user just says 'close it', 'close that', or 'close the tab', call this with no target and it closes the most recently opened one. If the user names which site (e.g. 'close the Wikipedia one'), pass that name or word as target so the right tab closes even if more than one is open.",
+    "4. open_link(url: string, title?: string) — opens a specific URL right inside the app's own Browser panel (not a new browser tab). Use this whenever the user asks you to open a link, a website, or a page they name or that came up earlier in the conversation, including 'tell me about this site' style requests where opening it helps.",
+    "5. close_link(target?: string) — closes a tab in the app's Browser panel that was previously opened with open_link. If the user just says 'close it', 'close that', or 'close the tab', call this with no target and it closes the most recently opened one. If the user names which site (e.g. 'close the Wikipedia one'), pass that name or word as target so the right tab closes even if more than one is open.",
     "6. write_code(code: string, language?: string, filename?: string) — puts code into the on-screen code editor panel instead of speaking it. Use this whenever the user asks you to write, generate, debug, fix, or add a feature to code, or when they paste code and ask for changes. Always return the FULL updated code in the code argument, not just a snippet or diff.",
-    "7. build_app(html: string, title?: string) — use this whenever the user asks you to build them an app, a website, a tool, or anything they want to actually see running and interact with (not just a code snippet). The html argument must be ONE complete, self-contained HTML document starting with <!DOCTYPE html>, with all CSS in a <style> tag and all JS in a <script> tag inline — no external files, no build step, no import statements. Keep it fully working with no placeholders. This opens a live preview and a link the user can open in a new tab.",
+    '7. build_app(html: string, title?: string) — use this whenever the user asks you to build them an app, a website, a tool, or anything they want to actually see running and interact with (not just a code snippet). The html argument must be ONE complete, self-contained HTML document starting with <!DOCTYPE html>, with all JS in a <script> tag inline — no build step, no import statements, no external files EXCEPT you may add exactly one <script src="https://cdn.tailwindcss.com"></script> in the <head> and then style everything with Tailwind utility classes instead of hand-written CSS, since that CDN script needs no build step and runs entirely in the browser. If you use it, do not also write a separate <style> block for the same elements — pick Tailwind classes or plain CSS in <style>, not a mix for the same component. Whichever you use, make it look genuinely designed: a real color palette (not just default black-on-white), deliberate spacing and type hierarchy, and rounded/shadowed cards or buttons where they fit the app — avoid the bare, unstyled look of a first draft. Keep it fully working with no placeholders. This opens a live preview and a link the user can open in a new tab.',
     "8. make_file(content: string, filename?: string) — use this whenever the user asks you to write something they clearly want as a downloadable file rather than a spoken reply or code to run: a document, a report, a letter, notes, a CSV, a list, a plain text or markdown file, etc. Give the filename a sensible extension (e.g. notes.md, data.csv, letter.txt) so it downloads as the right file type. Always return the FULL file content, not a partial draft. This opens a panel with a download link and a copy button.",
-    '9. open_panel(panel: "history"|"code"|"app"|"files") — opens one of the app\'s own side panels hands-free: "history" (chat history + memory + teacher mode toggle), "code" (code editor), "app" (app preview), "files" (downloadable file output). Use this whenever the user says things like "open the history tab", "show me the code panel", "open the app preview", "show my files", etc. This is for the app\'s own UI panels, NOT for external websites — use open_link for those.',
-    '10. close_panel(panel?: "history"|"code"|"app"|"files") — closes one of the app\'s own side panels. If the user just says "close this panel" or "close it" without naming one, call this with no panel argument and it closes whatever is currently open. If they name a specific panel, pass it so the right one closes.',
+    '9. open_panel(panel: "history"|"code"|"app"|"files"|"browser") — opens one of the app\'s own side panels hands-free: "history" (chat history + memory + teacher mode toggle), "code" (code editor), "app" (app preview), "files" (downloadable file output), "browser" (the in-app web browser tabs). Use this whenever the user says things like "open the history tab", "show me the code panel", "open the app preview", "show my files", "open the browser panel", etc. This is for the app\'s own UI panels, NOT for external websites — use open_link for those.',
+    '10. close_panel(panel?: "history"|"code"|"app"|"files"|"browser") — closes one of the app\'s own side panels. If the user just says "close this panel" or "close it" without naming one, call this with no panel argument and it closes whatever is currently open. If they name a specific panel, pass it so the right one closes.',
     "When the user's request needs one of these, respond with ONLY strict JSON and nothing else, no markdown fences: ",
     '{"tool_call": {"name": "manage_tasks", "arguments": {"action": "add", "title": "..."}}}',
     "or",
@@ -521,81 +521,9 @@ function mimeTypeForFilename(filename: string): string {
   return map[ext] ?? "text/plain";
 }
 
-// Tracks tabs opened via open_link so close_link can close them again later.
-// window.open() only returns a handle we can call .close() on when we OMIT
-// noopener — with noopener set, browsers always return null, which is why
-// closing previously-opened tabs wasn't possible before.
-interface OpenTab {
-  win: Window;
-  url: string;
-  title: string;
-}
-const openTabs: OpenTab[] = [];
-
-// Opens a specific URL the user (or the model) names. Same popup-blocker
-// caveat as above applies when this runs off a voice turn rather than a
-// direct click.
-async function openLink(args: Record<string, any>): Promise<string> {
-  const { url, title } = args;
-  if (!url || !String(url).trim()) return "No URL given to open.";
-  try {
-    // noreferrer only (no noopener) so we keep a closable handle.
-    const win = window.open(url, "_blank", "noreferrer");
-    if (!win) {
-      return `Tried to open ${title || url}, but the browser blocked the popup — you may need to allow popups for this site.`;
-    }
-    openTabs.push({
-      win,
-      url: String(url),
-      title: title ? String(title) : String(url),
-    });
-    return `Opened ${title || url} in a new tab.`;
-  } catch (err) {
-    console.error("open_link failed", err);
-    return `Couldn't open ${url}.`;
-  }
-}
-
-// Closes a tab previously opened with open_link. If `target` is given (a
-// word from the site's title or URL), closes the most recent match;
-// otherwise closes the most recently opened tab still open.
-async function closeLink(args: Record<string, any>): Promise<string> {
-  const { target } = args;
-  // Drop anything the user already closed by hand so we don't try to close
-  // stale/closed handles or match against them.
-  for (let i = openTabs.length - 1; i >= 0; i--) {
-    if (openTabs[i].win.closed) openTabs.splice(i, 1);
-  }
-  if (openTabs.length === 0) {
-    return "There's no tab I opened that's still open.";
-  }
-
-  let index = openTabs.length - 1;
-  if (target && String(target).trim()) {
-    const needle = String(target).trim().toLowerCase();
-    const found = openTabs
-      .map((t, i) => ({ t, i }))
-      .reverse()
-      .find(
-        ({ t }) =>
-          t.title.toLowerCase().includes(needle) ||
-          t.url.toLowerCase().includes(needle),
-      );
-    if (!found) {
-      return `I couldn't find an open tab matching "${target}".`;
-    }
-    index = found.i;
-  }
-
-  const [tab] = openTabs.splice(index, 1);
-  try {
-    tab.win.close();
-    return `Closed ${tab.title}.`;
-  } catch (err) {
-    console.error("close_link failed", err);
-    return `Couldn't close ${tab.title} — some browsers block scripts from closing tabs they didn't open in this exact way.`;
-  }
-}
+// Note: in-app link/tab tracking (browserTabs) now lives in React state
+// inside the App component, so open_link/close_link are handled directly
+// in sendMessage rather than as free-standing tool functions.
 
 // Pulls the first fenced code block out of a reply, if any, so it can be
 // routed to the code editor panel instead of spoken/shown as raw text.
@@ -627,9 +555,9 @@ async function rememberFact(args: Record<string, any>): Promise<string> {
   return `Got it, I'll remember: ${cleanFact}`;
 }
 
-// Normalizes whatever panel name the model gives us to one of the four
+// Normalizes whatever panel name the model gives us to one of the five
 // known panels, so slightly-off model output ("chat history", "app
-// preview") still resolves correctly.
+// preview", "web page") still resolves correctly.
 function normalizePanelName(raw: unknown): PanelName | null {
   const s = String(raw ?? "")
     .trim()
@@ -637,6 +565,8 @@ function normalizePanelName(raw: unknown): PanelName | null {
   if (!s) return null;
   if (s.includes("hist")) return "history";
   if (s.includes("code") || s.includes("editor")) return "code";
+  if (s.includes("brows") || s.includes("web") || s.includes("site"))
+    return "browser";
   if (s.includes("app") || s.includes("preview")) return "app";
   if (s.includes("file")) return "files";
   return null;
@@ -646,12 +576,11 @@ async function runTool(call: ToolCall): Promise<string> {
   if (call.name === "manage_tasks") return manageTasks(call.arguments);
   if (call.name === "research_idea") return researchIdea(call.arguments);
   if (call.name === "remember") return rememberFact(call.arguments);
-  if (call.name === "open_link") return openLink(call.arguments);
-  if (call.name === "close_link") return closeLink(call.arguments);
-  // write_code, build_app, make_file, open_panel, and close_panel are
-  // intercepted in sendMessage before runTool is called, since they need to
-  // update React state (editor panel, app preview, file output panel, or
-  // side-panel visibility) directly.
+  // open_link, close_link, write_code, build_app, make_file, open_panel,
+  // and close_panel are all intercepted in sendMessage before runTool is
+  // called, since they need to update React state (browser tabs, editor
+  // panel, app preview, file output panel, or side-panel visibility)
+  // directly.
   return "Unknown tool.";
 }
 
@@ -993,6 +922,13 @@ function playAndWait(audio: HTMLAudioElement | null): Promise<void> {
   });
 }
 
+interface BrowserTab {
+  id: string;
+  url: string; // the URL actually loaded in the iframe (may be an embed variant)
+  originalUrl: string; // the link as given — used for "Open externally"
+  title: string;
+}
+
 function App() {
   const [conversations, setConversations] = useState<Conversation[]>(() =>
     loadConversations(),
@@ -1046,6 +982,16 @@ function App() {
   const [appLinkLabel, setAppLinkLabel] = useState("Copy link");
   const [isStreamingCode, setIsStreamingCode] = useState(false);
   const streamTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // In-app browser panel: every open_link call adds a tab here instead of
+  // opening a real new browser tab; close_link removes one the same way.
+  const [browserTabs, setBrowserTabs] = useState<BrowserTab[]>([]);
+  const [activeBrowserTabId, setActiveBrowserTabId] = useState<string | null>(
+    null,
+  );
+  const [showBrowser, setShowBrowser] = useState(false);
+  const activeBrowserTab =
+    browserTabs.find((t) => t.id === activeBrowserTabId) ?? null;
 
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -1166,7 +1112,7 @@ function App() {
   // Opens exactly one panel, hiding the others that share the same slot.
   // "history" lives in its own left-hand slot, so opening it doesn't touch
   // the right-hand panels and vice versa — mirrors the original mouse
-  // button behavior.
+  // button behavior. "browser" shares the right-hand slot with code/app/files.
   function openPanelByName(panel: PanelName) {
     if (panel === "history") {
       setShowHistory(true);
@@ -1175,6 +1121,7 @@ function App() {
     setShowCodeEditor(panel === "code");
     setShowAppPreview(panel === "app");
     setShowFileOutput(panel === "files");
+    setShowBrowser(panel === "browser");
   }
 
   // Closes one named panel, or — if no panel is named — whatever is
@@ -1186,12 +1133,127 @@ function App() {
       setShowCodeEditor(false);
       setShowAppPreview(false);
       setShowFileOutput(false);
+      setShowBrowser(false);
       return;
     }
     if (panel === "history") setShowHistory(false);
     if (panel === "code") setShowCodeEditor(false);
     if (panel === "app") setShowAppPreview(false);
     if (panel === "files") setShowFileOutput(false);
+    if (panel === "browser") setShowBrowser(false);
+  }
+
+  // ---- In-app "browser" tool handlers ----
+  // These replace the old window.open-based open_link/close_link: instead
+  // of a real new browser tab, a link opens as a tab inside the app's own
+  // Browser panel. Note: some sites send headers (X-Frame-Options / CSP
+  // frame-ancestors) that block being shown in ANY iframe — those will
+  // load blank here, which is why every tab also gets an "Open externally"
+  // fallback link in the panel itself.
+
+  // A handful of sites publish a dedicated "embed" URL format specifically
+  // meant to work inside someone else's iframe, even though their main
+  // site blocks it. We rewrite recognized links into that form so they
+  // actually play/load hands-free instead of coming up blank. This only
+  // covers a single piece of content (one video, one clip) — it can't make
+  // a site's search results, home feed, or logged-in pages embeddable,
+  // since those really are blocked at the server and there's no client-side
+  // workaround for that.
+  function toEmbeddableUrl(rawUrl: string): string {
+    try {
+      const u = new URL(rawUrl);
+      const host = u.hostname.replace(/^www\./, "");
+
+      if (host === "youtube.com" || host === "m.youtube.com") {
+        const id = u.searchParams.get("v");
+        if (id) return `https://www.youtube.com/embed/${id}`;
+        const shortsMatch = u.pathname.match(/^\/shorts\/([\w-]+)/);
+        if (shortsMatch)
+          return `https://www.youtube.com/embed/${shortsMatch[1]}`;
+      }
+      if (host === "youtu.be") {
+        const id = u.pathname.replace(/^\//, "");
+        if (id) return `https://www.youtube.com/embed/${id}`;
+      }
+      if (host === "vimeo.com") {
+        const id = u.pathname.replace(/^\//, "");
+        if (/^\d+$/.test(id)) return `https://player.vimeo.com/video/${id}`;
+      }
+      return rawUrl;
+    } catch {
+      return rawUrl;
+    }
+  }
+
+  // Sites known to block embedding entirely, with no embed-URL escape
+  // hatch — used purely to warn the person up front instead of letting
+  // them wait on a page that will only ever load blank.
+  const NO_EMBED_HOSTS = [
+    "google.com",
+    "instagram.com",
+    "facebook.com",
+    "x.com",
+    "twitter.com",
+    "linkedin.com",
+  ];
+
+  function openLinkInApp(args: Record<string, any>): string {
+    const { url, title } = args;
+    if (!url || !String(url).trim()) return "No URL given to open.";
+    const rawUrl = String(url).trim();
+    const finalUrl = toEmbeddableUrl(rawUrl);
+    const tab: BrowserTab = {
+      id: makeId(),
+      url: finalUrl,
+      originalUrl: rawUrl,
+      title: title ? String(title) : rawUrl,
+    };
+    setBrowserTabs((prev) => [...prev, tab]);
+    setActiveBrowserTabId(tab.id);
+    openPanelByName("browser");
+
+    let host = "";
+    try {
+      host = new URL(rawUrl).hostname.replace(/^www\./, "");
+    } catch {
+      /* not a full URL — skip the warning check */
+    }
+    if (NO_EMBED_HOSTS.some((h) => host === h || host.endsWith(`.${h}`))) {
+      return `Opened ${tab.title} in the browser panel, but a heads up: this site usually blocks itself from loading inside another page, so it may come up blank — say "open it externally" if that happens.`;
+    }
+    return `Opened ${tab.title} right here in the browser panel.`;
+  }
+
+  function closeLinkInApp(args: Record<string, any>): string {
+    const { target } = args;
+    const tabs = browserTabs;
+    if (tabs.length === 0) return "There's no tab open to close.";
+
+    let idx = tabs.length - 1;
+    if (target && String(target).trim()) {
+      const needle = String(target).trim().toLowerCase();
+      const found = tabs
+        .map((t, i) => ({ t, i }))
+        .reverse()
+        .find(
+          ({ t }) =>
+            t.title.toLowerCase().includes(needle) ||
+            t.url.toLowerCase().includes(needle),
+        );
+      if (!found) return `I couldn't find an open tab matching "${target}".`;
+      idx = found.i;
+    }
+
+    const closed = tabs[idx];
+    const next = tabs.filter((_, i) => i !== idx);
+    setBrowserTabs(next);
+    if (next.length === 0) {
+      setActiveBrowserTabId(null);
+      setShowBrowser(false);
+    } else if (closed.id === activeBrowserTabId) {
+      setActiveBrowserTabId(next[next.length - 1].id);
+    }
+    return `Closed ${closed.title}.`;
   }
 
   async function sendMessage(text: string) {
@@ -1228,7 +1290,11 @@ function App() {
     if (toolCall) {
       let toolResultText: string;
 
-      if (toolCall.name === "write_code") {
+      if (toolCall.name === "open_link") {
+        toolResultText = openLinkInApp(toolCall.arguments);
+      } else if (toolCall.name === "close_link") {
+        toolResultText = closeLinkInApp(toolCall.arguments);
+      } else if (toolCall.name === "write_code") {
         setPhase("coding");
         const { code, language, filename } = toolCall.arguments;
         revealCodeInEditor(
@@ -1284,7 +1350,7 @@ function App() {
         const panel = normalizePanelName(toolCall.arguments?.panel);
         if (!panel) {
           toolResultText =
-            "I didn't catch which panel to open — try history, code, app, or files.";
+            "I didn't catch which panel to open — try history, code, app, files, or browser.";
         } else {
           openPanelByName(panel);
           const label =
@@ -1294,7 +1360,9 @@ function App() {
                 ? "Code editor"
                 : panel === "app"
                   ? "App preview"
-                  : "Files";
+                  : panel === "browser"
+                    ? "Browser"
+                    : "Files";
           toolResultText = `Opened the ${label} panel for you.`;
         }
       } else if (toolCall.name === "close_panel") {
@@ -1562,6 +1630,11 @@ function App() {
     else openPanelByName("files");
   }
 
+  function toggleBrowser() {
+    if (showBrowser) closePanelByName("browser");
+    else openPanelByName("browser");
+  }
+
   async function copyFileContent() {
     try {
       await navigator.clipboard.writeText(fileOutput.content);
@@ -1667,6 +1740,17 @@ function App() {
             className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
           >
             ▶ <span className="hidden sm:inline">App</span>
+          </button>
+          <button
+            onClick={toggleBrowser}
+            className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
+          >
+            🌐 <span className="hidden sm:inline">Browser</span>
+            {browserTabs.length > 0 && (
+              <span className="ml-1 text-[#3ddcff]">
+                ({browserTabs.length})
+              </span>
+            )}
           </button>
           <button
             onClick={toggleFileOutput}
@@ -1947,6 +2031,90 @@ function App() {
               it's a local preview, not a hosted public URL. Reloading the page
               or closing the tab will invalidate it; use "Open in new tab" or
               copy the code to deploy it somewhere permanent.
+            </p>
+          </div>
+        )}
+
+        {/* in-app browser panel */}
+        {showBrowser && (
+          <div className="absolute inset-y-0 right-0 w-full sm:w-[30rem] z-30 bg-[#03060a]/95 border-l border-[#123047] backdrop-blur-sm flex flex-col p-4 gap-3 overflow-y-auto">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[10px] tracking-[0.3em] text-[#3d6b85] uppercase">
+                Browser
+              </span>
+              <button
+                onClick={() => closePanelByName("browser")}
+                className="text-[#3d6b85] hover:text-[#3ddcff] text-xs"
+              >
+                ✕
+              </button>
+            </div>
+
+            {browserTabs.length > 0 && (
+              <div className="flex items-center gap-1 overflow-x-auto pb-1 -mx-1 px-1">
+                {browserTabs.map((tab) => (
+                  <div
+                    key={tab.id}
+                    onClick={() => setActiveBrowserTabId(tab.id)}
+                    className={`group flex items-center gap-1.5 shrink-0 max-w-[9rem] px-2.5 py-1.5 border cursor-pointer text-[10px] transition-colors ${
+                      tab.id === activeBrowserTabId
+                        ? "border-[#3ddcff] bg-[#3ddcff]/10 text-[#8fe3ff]"
+                        : "border-[#123047] text-[#c9e8f7] hover:border-[#1c5578]"
+                    }`}
+                  >
+                    <span className="truncate">{tab.title}</span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        closeLinkInApp({ target: tab.title });
+                      }}
+                      className="opacity-0 group-hover:opacity-100 text-[#ff5d5d] shrink-0"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="border border-[#123047] bg-[#0a0f14] flex flex-col">
+              <div className="flex items-center justify-between px-3 py-2 border-b border-[#123047] text-[9px] uppercase tracking-widest text-[#3d6b85]">
+                <span className="truncate">
+                  {activeBrowserTab?.originalUrl || "no page open"}
+                </span>
+                <button
+                  onClick={() =>
+                    activeBrowserTab &&
+                    window.open(
+                      activeBrowserTab.originalUrl,
+                      "_blank",
+                      "noopener,noreferrer",
+                    )
+                  }
+                  disabled={!activeBrowserTab}
+                  className="text-[#3ddcff] hover:text-[#8fe3ff] disabled:opacity-30 disabled:hover:text-[#3ddcff] tracking-widest shrink-0"
+                >
+                  Open externally
+                </button>
+              </div>
+              {activeBrowserTab ? (
+                <iframe
+                  key={activeBrowserTab.id}
+                  title={activeBrowserTab.title}
+                  src={activeBrowserTab.url}
+                  className="w-full h-[45vh] sm:h-[55vh] bg-white"
+                />
+              ) : (
+                <p className="p-3 text-[11px] text-[#c9e8f7] leading-relaxed">
+                  Ask Jarvis to open a link, and it'll load right here.
+                </p>
+              )}
+            </div>
+
+            <p className="text-[9px] text-[#3d6b85] leading-relaxed">
+              Some sites block being shown inside another page and will appear
+              blank here — use "Open externally" for those. Say "close it" or
+              "close the [site name] one" to close a tab hands free.
             </p>
           </div>
         )}
