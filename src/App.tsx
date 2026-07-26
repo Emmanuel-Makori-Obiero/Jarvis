@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 const GEMMA_API_KEY = import.meta.env.VITE_GEMMA_API_KEY;
@@ -154,7 +154,32 @@ interface Message {
 }
 
 // The four side panels the assistant can open/close hands-free by voice.
-type PanelName = "history" | "code" | "app" | "files" | "browser";
+type PanelName = "history" | "code" | "app" | "files" | "browser" | "settings";
+
+// ---- Electron bridge (desktop app only) ----
+// Exposed by electron/preload.cjs via contextBridge. Undefined when running
+// in a plain browser tab, so every call site below checks for it and
+// degrades to an explanatory message rather than throwing. This is the
+// ONLY surface that can launch or kill a native OS process, and it only
+// ever acts on entries already present in the user's saved whitelist —
+// there is no code path from a voice transcript straight to a shell
+// command.
+interface AllowedApp {
+  id: string;
+  label: string;
+}
+interface ElectronBridge {
+  listAllowedApps: () => Promise<AllowedApp[]>;
+  addAllowedApp: () => Promise<AllowedApp | null>; // opens a native "pick an app" dialog
+  removeAllowedApp: (id: string) => Promise<void>;
+  openApp: (id: string) => Promise<{ ok: boolean; message: string }>;
+  closeApp: (id: string) => Promise<{ ok: boolean; message: string }>;
+}
+declare global {
+  interface Window {
+    electronAPI?: ElectronBridge;
+  }
+}
 
 interface Conversation {
   id: string;
@@ -208,17 +233,19 @@ function buildSystemInstruction(
     "You are given the FULL conversation history on every turn, including everything said earlier in this call or chat. Actually use it: remember names, numbers, decisions, and anything the user told you earlier in this same session, and refer back to them naturally when relevant. Never ask the user to repeat something they already told you earlier in this conversation — check the history first.",
     "When walking someone through a multi-step task (like programming or debugging), give ONE step at a time, keep it short, then explicitly ask something like 'let me know once you've done that' before moving to the next step. Never dump several steps at once during a live call.",
     "",
-    "You have ten tools you can call:",
+    "You have twelve tools you can call:",
     '1. manage_tasks(action: "add"|"list"|"complete"|"delete", title?: string, task_id?: string) — reads/writes the user\'s task list.',
     "2. research_idea(idea: string) — runs a real web search on a business idea, opens the top source in a new browser tab, and returns a short brief with citations.",
     "3. remember(fact: string) — saves a short, durable fact about the user (their name, preferences, ongoing projects, recurring context) so you can recall it in future conversations, even new ones. Call this whenever the user shares something worth remembering long-term. Do not call it for one-off details that only matter for this exchange.",
     "4. open_link(url: string, title?: string) — opens a specific URL right inside the app's own Browser panel (not a new browser tab). Use this whenever the user asks you to open a link, a website, or a page they name or that came up earlier in the conversation, including 'tell me about this site' style requests where opening it helps.",
     "5. close_link(target?: string) — closes a tab in the app's Browser panel that was previously opened with open_link. If the user just says 'close it', 'close that', or 'close the tab', call this with no target and it closes the most recently opened one. If the user names which site (e.g. 'close the Wikipedia one'), pass that name or word as target so the right tab closes even if more than one is open.",
     "6. write_code(code: string, language?: string, filename?: string) — puts code into the on-screen code editor panel instead of speaking it. Use this whenever the user asks you to write, generate, debug, fix, or add a feature to code, or when they paste code and ask for changes. Always return the FULL updated code in the code argument, not just a snippet or diff.",
-    '7. build_app(html: string, title?: string) — use this whenever the user asks you to build them an app, a website, a tool, or anything they want to actually see running and interact with (not just a code snippet). The html argument must be ONE complete, self-contained HTML document starting with <!DOCTYPE html>, with all JS in a <script> tag inline — no build step, no import statements, no external files EXCEPT you may add exactly one <script src="https://cdn.tailwindcss.com"></script> in the <head> and then style everything with Tailwind utility classes instead of hand-written CSS, since that CDN script needs no build step and runs entirely in the browser. If you use it, do not also write a separate <style> block for the same elements — pick Tailwind classes or plain CSS in <style>, not a mix for the same component. Whichever you use, make it look genuinely designed: a real color palette (not just default black-on-white), deliberate spacing and type hierarchy, and rounded/shadowed cards or buttons where they fit the app — avoid the bare, unstyled look of a first draft. Keep it fully working with no placeholders. This opens a live preview and a link the user can open in a new tab.',
+    "7. build_app(html: string, title?: string) — use this whenever the user asks you to build them an app, a website, a tool, or anything they want to actually see running and interact with (not just a code snippet). The html argument must be ONE complete, self-contained HTML document starting with <!DOCTYPE html>, with all JS in a <script> tag inline — no build step, no import statements, no external files EXCEPT you may add exactly one <script src=\"https://cdn.tailwindcss.com\"></script> in the <head> and then style everything with Tailwind utility classes instead of hand-written CSS, since that CDN script needs no build step and runs entirely in the browser. If you use it, do not also write a separate <style> block for the same elements — pick Tailwind classes or plain CSS in <style>, not a mix for the same component. Whichever you use, make it look genuinely designed: a real color palette (not just default black-on-white), deliberate spacing and type hierarchy, and rounded/shadowed cards or buttons where they fit the app — avoid the bare, unstyled look of a first draft. Keep it fully working with no placeholders. This opens a live preview and a link the user can open in a new tab.",
     "8. make_file(content: string, filename?: string) — use this whenever the user asks you to write something they clearly want as a downloadable file rather than a spoken reply or code to run: a document, a report, a letter, notes, a CSV, a list, a plain text or markdown file, etc. Give the filename a sensible extension (e.g. notes.md, data.csv, letter.txt) so it downloads as the right file type. Always return the FULL file content, not a partial draft. This opens a panel with a download link and a copy button.",
-    '9. open_panel(panel: "history"|"code"|"app"|"files"|"browser") — opens one of the app\'s own side panels hands-free: "history" (chat history + memory + teacher mode toggle), "code" (code editor), "app" (app preview), "files" (downloadable file output), "browser" (the in-app web browser tabs). Use this whenever the user says things like "open the history tab", "show me the code panel", "open the app preview", "show my files", "open the browser panel", etc. This is for the app\'s own UI panels, NOT for external websites — use open_link for those.',
-    '10. close_panel(panel?: "history"|"code"|"app"|"files"|"browser") — closes one of the app\'s own side panels. If the user just says "close this panel" or "close it" without naming one, call this with no panel argument and it closes whatever is currently open. If they name a specific panel, pass it so the right one closes.',
+    '9. open_panel(panel: "history"|"code"|"app"|"files"|"browser"|"settings") — opens one of the app\'s own side panels hands-free: "history" (chat history + memory + teacher mode toggle), "code" (code editor), "app" (app preview), "files" (downloadable file output), "browser" (the in-app web browser tabs), "settings" (the list of native apps you\'re allowed to open/close). Use this whenever the user says things like "open the history tab", "show me the code panel", "open the app preview", "show my files", "open the browser panel", "show me which apps you can control", etc. This is for the app\'s own UI panels, NOT for external websites (use open_link) and NOT for native desktop apps (use open_app).',
+    '10. close_panel(panel?: "history"|"code"|"app"|"files"|"browser"|"settings") — closes one of the app\'s own side panels. If the user just says "close this panel" or "close it" without naming one, call this with no panel argument and it closes whatever is currently open. If they name a specific panel, pass it so the right one closes.',
+    "11. open_app(name: string) — launches a native desktop application (not a website, not a panel). Only works in the desktop build of this app, and ONLY for apps the user has already added to their allowed-apps list in Settings — it will never attempt to launch anything not on that list, so if the user asks for something unfamiliar, just call it with their name as given and let the result tell you whether it's allowed. Use this for requests like 'open Spotify', 'launch my email client', 'start Photoshop'.",
+    "12. close_app(name: string) — force-closes a native desktop application previously opened this way. This ends the app the same way force-quitting it would — any unsaved work in that app is lost, so if the user's request sounds ambiguous about which app, ask rather than guessing. Only works in the desktop build, and only for apps on the allowed-apps list.",
     "When the user's request needs one of these, respond with ONLY strict JSON and nothing else, no markdown fences: ",
     '{"tool_call": {"name": "manage_tasks", "arguments": {"action": "add", "title": "..."}}}',
     "or",
@@ -239,6 +266,10 @@ function buildSystemInstruction(
     '{"tool_call": {"name": "open_panel", "arguments": {"panel": "history"}}}',
     "or",
     '{"tool_call": {"name": "close_panel", "arguments": {"panel": "history"}}}',
+    "or",
+    '{"tool_call": {"name": "open_app", "arguments": {"name": "Spotify"}}}',
+    "or",
+    '{"tool_call": {"name": "close_app", "arguments": {"name": "Spotify"}}}',
     "Otherwise just respond normally in plain conversational text. Never read code out loud or paste large code blocks into a normal spoken reply — always use write_code or build_app for that and just briefly describe what you changed.",
     "If the user asks you to explain code (e.g. 'explain this' or 'walk me through every line'), do NOT call write_code and do NOT wrap anything in triple-backtick code fences — just explain it in plain conversational prose, referencing lines by what they do rather than quoting them verbatim, going through it in order from top to bottom.",
   ];
@@ -376,7 +407,9 @@ interface ToolCall {
     | "build_app"
     | "make_file"
     | "open_panel"
-    | "close_panel";
+    | "close_panel"
+    | "open_app"
+    | "close_app";
   arguments: Record<string, any>;
 }
 
@@ -567,6 +600,8 @@ function normalizePanelName(raw: unknown): PanelName | null {
   if (s.includes("code") || s.includes("editor")) return "code";
   if (s.includes("brows") || s.includes("web") || s.includes("site"))
     return "browser";
+  if (s.includes("setting") || s.includes("whitelist") || s.includes("allow"))
+    return "settings";
   if (s.includes("app") || s.includes("preview")) return "app";
   if (s.includes("file")) return "files";
   return null;
@@ -576,11 +611,11 @@ async function runTool(call: ToolCall): Promise<string> {
   if (call.name === "manage_tasks") return manageTasks(call.arguments);
   if (call.name === "research_idea") return researchIdea(call.arguments);
   if (call.name === "remember") return rememberFact(call.arguments);
-  // open_link, close_link, write_code, build_app, make_file, open_panel,
-  // and close_panel are all intercepted in sendMessage before runTool is
-  // called, since they need to update React state (browser tabs, editor
-  // panel, app preview, file output panel, or side-panel visibility)
-  // directly.
+  // open_link, close_link, open_app, close_app, write_code, build_app,
+  // make_file, open_panel, and close_panel are all intercepted in
+  // sendMessage before runTool is called, since they need to update React
+  // state (browser tabs, editor panel, app preview, file output panel,
+  // allowed-apps list, or side-panel visibility) directly.
   return "Unknown tool.";
 }
 
@@ -993,6 +1028,29 @@ function App() {
   const activeBrowserTab =
     browserTabs.find((t) => t.id === activeBrowserTabId) ?? null;
 
+  // Settings panel: the list of native apps Jarvis is allowed to open/close.
+  // Lives in the Electron main process (electron/appControl.cjs), not in
+  // this app's own storage, so it survives across chats/conversations and
+  // can't be edited by anything other than the native "pick an app" dialog.
+  const [showSettings, setShowSettings] = useState(false);
+  const [allowedApps, setAllowedApps] = useState<AllowedApp[]>([]);
+  const [isDesktopApp, setIsDesktopApp] = useState(false);
+
+  const refreshAllowedApps = useCallback(async () => {
+    if (!window.electronAPI) return;
+    try {
+      const apps = await window.electronAPI.listAllowedApps();
+      setAllowedApps(apps);
+    } catch (err) {
+      console.error("Couldn't load the allowed-apps list", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    setIsDesktopApp(Boolean(window.electronAPI));
+    refreshAllowedApps();
+  }, [refreshAllowedApps]);
+
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [listening, setListening] = useState(false);
@@ -1122,6 +1180,8 @@ function App() {
     setShowAppPreview(panel === "app");
     setShowFileOutput(panel === "files");
     setShowBrowser(panel === "browser");
+    setShowSettings(panel === "settings");
+    if (panel === "settings") refreshAllowedApps();
   }
 
   // Closes one named panel, or — if no panel is named — whatever is
@@ -1134,6 +1194,7 @@ function App() {
       setShowAppPreview(false);
       setShowFileOutput(false);
       setShowBrowser(false);
+      setShowSettings(false);
       return;
     }
     if (panel === "history") setShowHistory(false);
@@ -1141,6 +1202,7 @@ function App() {
     if (panel === "app") setShowAppPreview(false);
     if (panel === "files") setShowFileOutput(false);
     if (panel === "browser") setShowBrowser(false);
+    if (panel === "settings") setShowSettings(false);
   }
 
   // ---- In-app "browser" tool handlers ----
@@ -1168,8 +1230,7 @@ function App() {
         const id = u.searchParams.get("v");
         if (id) return `https://www.youtube.com/embed/${id}`;
         const shortsMatch = u.pathname.match(/^\/shorts\/([\w-]+)/);
-        if (shortsMatch)
-          return `https://www.youtube.com/embed/${shortsMatch[1]}`;
+        if (shortsMatch) return `https://www.youtube.com/embed/${shortsMatch[1]}`;
       }
       if (host === "youtu.be") {
         const id = u.pathname.replace(/^\//, "");
@@ -1256,6 +1317,79 @@ function App() {
     return `Closed ${closed.title}.`;
   }
 
+  // ---- Native app control (desktop build only) ----
+  // Matches whatever name the model heard against the user's saved
+  // whitelist (case-insensitive substring, same matching style as
+  // closeLinkInApp) rather than trusting the spoken name directly — an app
+  // not already on the list simply can't be launched or killed, full stop.
+  function findAllowedApp(name: string): AllowedApp | null {
+    const needle = name.trim().toLowerCase();
+    if (!needle) return null;
+    const exact = allowedApps.find((a) => a.label.toLowerCase() === needle);
+    if (exact) return exact;
+    return (
+      allowedApps.find((a) => a.label.toLowerCase().includes(needle)) ?? null
+    );
+  }
+
+  async function openAppInApp(args: Record<string, any>): Promise<string> {
+    const { name } = args;
+    if (!name || !String(name).trim()) return "No app name given to open.";
+    if (!window.electronAPI) {
+      return "Opening native apps only works in the desktop version of this app, not in a browser tab.";
+    }
+    const match = findAllowedApp(String(name));
+    if (!match) {
+      return `"${name}" isn't on the allowed-apps list, so I can't open it. Add it in Settings first if you want me to be able to.`;
+    }
+    try {
+      const result = await window.electronAPI.openApp(match.id);
+      return result.message;
+    } catch (err) {
+      console.error("open_app failed", err);
+      return `Something went wrong trying to open ${match.label}.`;
+    }
+  }
+
+  async function closeAppInApp(args: Record<string, any>): Promise<string> {
+    const { name } = args;
+    if (!name || !String(name).trim()) return "No app name given to close.";
+    if (!window.electronAPI) {
+      return "Closing native apps only works in the desktop version of this app, not in a browser tab.";
+    }
+    const match = findAllowedApp(String(name));
+    if (!match) {
+      return `"${name}" isn't on the allowed-apps list, so I can't close it.`;
+    }
+    try {
+      const result = await window.electronAPI.closeApp(match.id);
+      return result.message;
+    } catch (err) {
+      console.error("close_app failed", err);
+      return `Something went wrong trying to close ${match.label}.`;
+    }
+  }
+
+  async function addAllowedApp() {
+    if (!window.electronAPI) return;
+    try {
+      const added = await window.electronAPI.addAllowedApp();
+      if (added) await refreshAllowedApps();
+    } catch (err) {
+      console.error("Couldn't add an allowed app", err);
+    }
+  }
+
+  async function removeAllowedApp(id: string) {
+    if (!window.electronAPI) return;
+    try {
+      await window.electronAPI.removeAllowedApp(id);
+      await refreshAllowedApps();
+    } catch (err) {
+      console.error("Couldn't remove an allowed app", err);
+    }
+  }
+
   async function sendMessage(text: string) {
     const trimmed = text.trim();
     if (!trimmed || loading) return;
@@ -1294,6 +1428,10 @@ function App() {
         toolResultText = openLinkInApp(toolCall.arguments);
       } else if (toolCall.name === "close_link") {
         toolResultText = closeLinkInApp(toolCall.arguments);
+      } else if (toolCall.name === "open_app") {
+        toolResultText = await openAppInApp(toolCall.arguments);
+      } else if (toolCall.name === "close_app") {
+        toolResultText = await closeAppInApp(toolCall.arguments);
       } else if (toolCall.name === "write_code") {
         setPhase("coding");
         const { code, language, filename } = toolCall.arguments;
@@ -1350,7 +1488,7 @@ function App() {
         const panel = normalizePanelName(toolCall.arguments?.panel);
         if (!panel) {
           toolResultText =
-            "I didn't catch which panel to open — try history, code, app, files, or browser.";
+            "I didn't catch which panel to open — try history, code, app, files, browser, or settings.";
         } else {
           openPanelByName(panel);
           const label =
@@ -1362,7 +1500,9 @@ function App() {
                   ? "App preview"
                   : panel === "browser"
                     ? "Browser"
-                    : "Files";
+                    : panel === "settings"
+                      ? "Settings"
+                      : "Files";
           toolResultText = `Opened the ${label} panel for you.`;
         }
       } else if (toolCall.name === "close_panel") {
@@ -1635,6 +1775,11 @@ function App() {
     else openPanelByName("browser");
   }
 
+  function toggleSettings() {
+    if (showSettings) closePanelByName("settings");
+    else openPanelByName("settings");
+  }
+
   async function copyFileContent() {
     try {
       await navigator.clipboard.writeText(fileOutput.content);
@@ -1725,41 +1870,58 @@ function App() {
           </div>
           <button
             onClick={toggleHistory}
+            aria-label={showHistory ? "Close history panel" : "Open history panel"}
             className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
           >
             ☰ <span className="hidden sm:inline">History</span>
           </button>
           <button
             onClick={toggleCodeEditor}
+            aria-label={showCodeEditor ? "Close code editor panel" : "Open code editor panel"}
             className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
           >
             {"</>"} <span className="hidden sm:inline">Code</span>
           </button>
           <button
             onClick={toggleAppPreview}
+            aria-label={showAppPreview ? "Close app preview panel" : "Open app preview panel"}
             className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
           >
             ▶ <span className="hidden sm:inline">App</span>
           </button>
           <button
             onClick={toggleBrowser}
+            aria-label={
+              showBrowser
+                ? "Close browser panel"
+                : `Open browser panel${browserTabs.length > 0 ? `, ${browserTabs.length} tabs open` : ""}`
+            }
             className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
           >
             🌐 <span className="hidden sm:inline">Browser</span>
             {browserTabs.length > 0 && (
-              <span className="ml-1 text-[#3ddcff]">
-                ({browserTabs.length})
-              </span>
+              <span className="ml-1 text-[#3ddcff]">({browserTabs.length})</span>
             )}
           </button>
           <button
             onClick={toggleFileOutput}
+            aria-label={showFileOutput ? "Close files panel" : "Open files panel"}
             className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
           >
             ⬇ <span className="hidden sm:inline">Files</span>
           </button>
+          {isDesktopApp && (
+            <button
+              onClick={toggleSettings}
+              aria-label={showSettings ? "Close settings panel" : "Open settings panel"}
+              className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
+            >
+              ⚙ <span className="hidden sm:inline">Settings</span>
+            </button>
+          )}
           <button
             onClick={callActive ? endCall : startCall}
+            aria-label={callActive ? "End live call" : "Start live call"}
             className={`px-3 sm:px-4 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border transition-colors whitespace-nowrap ${
               callActive
                 ? "border-[#ff5d5d] text-[#ff5d5d] hover:bg-[#ff5d5d]/10"
@@ -2112,10 +2274,70 @@ function App() {
             </div>
 
             <p className="text-[9px] text-[#3d6b85] leading-relaxed">
-              Some sites block being shown inside another page and will appear
-              blank here — use "Open externally" for those. Say "close it" or
-              "close the [site name] one" to close a tab hands free.
+              Some sites block being shown inside another page and will
+              appear blank here — use "Open externally" for those. Say
+              "close it" or "close the [site name] one" to close a tab hands
+              free.
             </p>
+          </div>
+        )}
+
+        {/* settings panel — allowed native apps */}
+        {showSettings && (
+          <div className="absolute inset-y-0 right-0 w-full sm:w-96 z-30 bg-[#03060a]/95 border-l border-[#123047] backdrop-blur-sm flex flex-col p-4 gap-3 overflow-y-auto">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[10px] tracking-[0.3em] text-[#3d6b85] uppercase">
+                Settings
+              </span>
+              <button
+                onClick={() => closePanelByName("settings")}
+                aria-label="Close settings panel"
+                className="text-[#3d6b85] hover:text-[#3ddcff] text-xs"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div>
+              <span className="text-[10px] tracking-[0.3em] text-[#3d6b85] uppercase">
+                Apps Jarvis can open or close
+              </span>
+              <p className="mt-1 text-[10px] text-[#3d6b85] leading-relaxed">
+                Only apps on this list can be opened or closed by voice or
+                chat — nothing else. Closing an app force-quits it, same as
+                ending its task; save your work first.
+              </p>
+            </div>
+
+            <button
+              onClick={addAllowedApp}
+              className="text-left px-3 py-2 border border-[#3ddcff] text-[#3ddcff] text-[10px] font-bold tracking-widest uppercase hover:bg-[#3ddcff]/10 transition-colors"
+            >
+              + Add an app…
+            </button>
+
+            <div className="flex flex-col gap-1">
+              {allowedApps.length === 0 && (
+                <p className="text-[#3d6b85] text-xs">
+                  No apps allowed yet — add one above.
+                </p>
+              )}
+              {allowedApps.map((app) => (
+                <div
+                  key={app.id}
+                  className="group flex items-center justify-between px-3 py-2 border border-[#123047] text-xs text-[#c9e8f7]"
+                >
+                  <span className="truncate">{app.label}</span>
+                  <button
+                    onClick={() => removeAllowedApp(app.id)}
+                    aria-label={`Remove ${app.label} from allowed apps`}
+                    className="opacity-0 group-hover:opacity-100 text-[#ff5d5d] ml-2 shrink-0"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
