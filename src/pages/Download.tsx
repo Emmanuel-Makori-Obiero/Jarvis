@@ -8,6 +8,8 @@ type ReleaseAsset = {
 
 type GithubRelease = {
   tag_name: string;
+  name: string;
+  published_at: string;
   assets: ReleaseAsset[];
 };
 
@@ -21,7 +23,7 @@ type Platform = {
 };
 
 const REPO = "Emmanuel-Makori-Obiero/Jarvis";
-const RELEASES_API = `https://api.github.com/repos/${REPO}/releases/latest`;
+const RELEASES_API = `https://api.github.com/repos/${REPO}/releases`;
 
 const WindowsIcon = () => (
   <svg
@@ -60,7 +62,7 @@ const platforms: Platform[] = [
     id: "windows",
     name: "Jarvis for Windows",
     detail: "Windows 10 and later, 64-bit",
-    fallbackHref: `https://github.com/${REPO}/releases/latest`,
+    fallbackHref: "https://play.google.com/",
     icon: <WindowsIcon />,
     matchers: [/\.exe$/i, /win.*\.zip$/i],
   },
@@ -68,7 +70,7 @@ const platforms: Platform[] = [
     id: "mac",
     name: "Jarvis for Mac",
     detail: "macOS 12 Monterey and later, Apple silicon or Intel",
-    fallbackHref: `https://github.com/${REPO}/releases/latest`,
+    fallbackHref: "",
     icon: <AppleIcon />,
     matchers: [/\.dmg$/i, /mac.*\.zip$/i],
   },
@@ -97,6 +99,18 @@ function formatSize(bytes: number) {
   return `${mb.toFixed(mb >= 100 ? 0 : 1)} MB`;
 }
 
+function formatDate(iso: string) {
+  try {
+    return new Date(iso).toLocaleDateString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+    });
+  } catch {
+    return "";
+  }
+}
+
 function findAsset(assets: ReleaseAsset[], matchers: RegExp[]) {
   return assets.find((asset) =>
     matchers.some((pattern) => pattern.test(asset.name)),
@@ -104,11 +118,12 @@ function findAsset(assets: ReleaseAsset[], matchers: RegExp[]) {
 }
 
 export default function Download() {
-  const [release, setRelease] = useState<GithubRelease | null>(null);
+  const [releases, setReleases] = useState<GithubRelease[]>([]);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "error">(
     "loading",
   );
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [openPlatform, setOpenPlatform] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -116,11 +131,11 @@ export default function Download() {
     fetch(RELEASES_API, { headers: { Accept: "application/vnd.github+json" } })
       .then((res) => {
         if (!res.ok) throw new Error(`GitHub API responded ${res.status}`);
-        return res.json() as Promise<GithubRelease>;
+        return res.json() as Promise<GithubRelease[]>;
       })
       .then((data) => {
         if (!cancelled) {
-          setRelease(data);
+          setReleases(data);
           setLoadState("ready");
         }
       })
@@ -133,8 +148,6 @@ export default function Download() {
     };
   }, []);
 
-  const version = release?.tag_name ?? null;
-
   const handleCopyLink = async (id: string, href: string) => {
     try {
       await navigator.clipboard.writeText(href);
@@ -144,6 +157,8 @@ export default function Download() {
       // clipboard unavailable, ignore
     }
   };
+
+  const latestRelease = releases[0];
 
   return (
     <section className="min-h-screen bg-neutral-950 text-neutral-100 px-6 py-16 sm:py-24">
@@ -159,20 +174,35 @@ export default function Download() {
           and running in a couple of minutes.
         </p>
         <p className="text-xs font-mono text-neutral-600 mb-12">
-          {loadState === "loading" && "Checking latest release…"}
-          {loadState === "ready" && version && `Latest release ${version}`}
-          {loadState === "error" &&
-            "Could not reach GitHub, showing store and release page links"}
+          {loadState === "loading" && "Checking releases…"}
+          {loadState === "ready" &&
+            latestRelease &&
+            `Latest release ${latestRelease.tag_name}`}
+          {loadState === "ready" &&
+            !latestRelease &&
+            "No releases published yet"}
+          {loadState === "error" && "Could not reach GitHub right now"}
         </p>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           {platforms.map((platform) => {
-            const asset = release
-              ? findAsset(release.assets, platform.matchers)
+            const latestAsset = latestRelease
+              ? findAsset(latestRelease.assets, platform.matchers)
               : undefined;
-            const href = asset?.browser_download_url ?? platform.fallbackHref;
-            const isDirectAsset = Boolean(asset);
-            const sizeLabel = asset ? formatSize(asset.size) : null;
+            const isDesktop =
+              platform.id === "windows" || platform.id === "mac";
+            const isStoreApp =
+              platform.id === "android" || platform.id === "ios";
+            const isOpen = openPlatform === platform.id;
+
+            const olderMatches = isDesktop
+              ? releases
+                  .map((release) => ({
+                    release,
+                    asset: findAsset(release.assets, platform.matchers),
+                  }))
+                  .filter((entry) => entry.asset)
+              : [];
 
             return (
               <div
@@ -184,7 +214,11 @@ export default function Download() {
                     {platform.icon}
                   </div>
                   <span className="text-xs font-mono text-neutral-500">
-                    {isDirectAsset ? version : "—"}
+                    {latestAsset
+                      ? latestRelease.tag_name
+                      : isStoreApp
+                        ? "store"
+                        : "—"}
                   </span>
                 </div>
 
@@ -194,48 +228,96 @@ export default function Download() {
                 </p>
 
                 <div className="flex items-center gap-3">
-                  <a
-                    href={href}
-                    target={isDirectAsset ? undefined : "_blank"}
-                    rel={isDirectAsset ? undefined : "noreferrer"}
-                    className="inline-flex items-center justify-center rounded-lg bg-cyan-500 px-4 py-2 text-sm font-medium text-neutral-950 hover:bg-cyan-400 transition-colors"
-                  >
-                    {isDirectAsset
-                      ? "Download"
-                      : platform.id === "android" || platform.id === "ios"
-                        ? "Get the app"
-                        : "View releases"}
-                  </a>
-                  {sizeLabel && (
-                    <span className="text-xs text-neutral-500 font-mono">
-                      {sizeLabel}
+                  {latestAsset ? (
+                    <a
+                      href={latestAsset.browser_download_url}
+                      className="inline-flex items-center justify-center rounded-lg bg-cyan-500 px-4 py-2 text-sm font-medium text-neutral-950 hover:bg-cyan-400 transition-colors"
+                    >
+                      Download
+                    </a>
+                  ) : isStoreApp ? (
+                    <a
+                      href={platform.fallbackHref}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center justify-center rounded-lg bg-cyan-500 px-4 py-2 text-sm font-medium text-neutral-950 hover:bg-cyan-400 transition-colors"
+                    >
+                      Get the app
+                    </a>
+                  ) : (
+                    <span className="inline-flex items-center justify-center rounded-lg border border-neutral-800 px-4 py-2 text-sm font-medium text-neutral-500">
+                      Not available yet
                     </span>
                   )}
-                  <button
-                    type="button"
-                    onClick={() => handleCopyLink(platform.id, href)}
-                    className="ml-auto text-xs text-neutral-500 hover:text-neutral-200 transition-colors"
-                  >
-                    {copiedId === platform.id ? "Link copied" : "Copy link"}
-                  </button>
+
+                  {latestAsset && (
+                    <span className="text-xs text-neutral-500 font-mono">
+                      {formatSize(latestAsset.size)}
+                    </span>
+                  )}
+
+                  {latestAsset && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleCopyLink(
+                          platform.id,
+                          latestAsset.browser_download_url,
+                        )
+                      }
+                      className="ml-auto text-xs text-neutral-500 hover:text-neutral-200 transition-colors"
+                    >
+                      {copiedId === platform.id ? "Link copied" : "Copy link"}
+                    </button>
+                  )}
                 </div>
+
+                {isDesktop && olderMatches.length > 0 && (
+                  <div className="mt-4 pt-4 border-t border-neutral-800">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setOpenPlatform(isOpen ? null : platform.id)
+                      }
+                      className="text-xs text-neutral-400 hover:text-cyan-400 transition-colors"
+                    >
+                      {isOpen
+                        ? "Hide other versions"
+                        : `View releases (${olderMatches.length})`}
+                    </button>
+
+                    {isOpen && (
+                      <ul className="mt-3 space-y-2">
+                        {olderMatches.map(({ release, asset }) => (
+                          <li
+                            key={release.tag_name}
+                            className="flex items-center justify-between text-sm rounded-lg bg-neutral-950/60 px-3 py-2"
+                          >
+                            <div className="flex flex-col">
+                              <span className="font-mono text-neutral-200">
+                                {release.tag_name}
+                              </span>
+                              <span className="text-xs text-neutral-500">
+                                {formatDate(release.published_at)} ·{" "}
+                                {formatSize(asset!.size)}
+                              </span>
+                            </div>
+                            <a
+                              href={asset!.browser_download_url}
+                              className="text-xs text-cyan-400 hover:text-cyan-300 font-medium"
+                            >
+                              Download
+                            </a>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })}
         </div>
-
-        <p className="mt-10 text-xs text-neutral-600">
-          Looking for older versions or a changelog? Check the{" "}
-          <a
-            href={`https://github.com/${REPO}/releases`}
-            target="_blank"
-            rel="noreferrer"
-            className="underline hover:text-neutral-300"
-          >
-            releases page
-          </a>
-          .
-        </p>
       </div>
     </section>
   );

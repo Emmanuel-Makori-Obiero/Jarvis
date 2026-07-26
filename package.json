@@ -2,6 +2,8 @@
   "name": "jarvis",
   "private": true,
   "version": "0.0.0",
+  "description": "Jarvis desktop assistant",
+  "author": "Emmanuel Makori Obiero",
   "type": "module",
   "main": "electron/main.js",
   "scripts": {
@@ -19,6 +21,7 @@
     "@tailwindcss/vite": "^4.3.3",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
+    "react-router-dom": "^7.18.1",
     "tailwindcss": "^4.3.3"
   },
   "devDependencies": {
