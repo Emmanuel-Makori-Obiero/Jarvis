@@ -24,3 +24,6 @@ dist-ssr
 *.sw?
 .envrelease/
 dist/
+release/
+dist/
+.env
