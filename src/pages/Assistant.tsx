@@ -52,6 +52,11 @@ const RESEARCH_MODEL_CHAIN_PREFERRED = [
 // to only those. If the discovery call itself fails (network, key issue),
 // we fall back to trying the hardcoded preferred lists as-is, so the app
 // still works even if this lookup can't run.
+interface GeminiModelListEntry {
+  name?: string;
+  supportedGenerationMethods?: string[];
+}
+
 let availableModelIdsCache: string[] | null = null;
 let availableModelIdsPromise: Promise<string[]> | null = null;
 
@@ -72,11 +77,12 @@ async function getAvailableModelIds(): Promise<string[]> {
         );
         return [];
       }
-      const ids: string[] = (json.models ?? [])
-        .filter((m: any) =>
+      const models: GeminiModelListEntry[] = json.models ?? [];
+      const ids: string[] = models
+        .filter((m) =>
           (m.supportedGenerationMethods ?? []).includes("generateContent"),
         )
-        .map((m: any) => String(m.name ?? "").replace(/^models\//, ""))
+        .map((m) => String(m.name ?? "").replace(/^models\//, ""))
         .filter(Boolean);
       console.log("Models available to this API key:", ids);
       availableModelIdsCache = ids;
@@ -126,7 +132,6 @@ const TTS_MODEL = "gemini-2.5-flash-preview-tts";
 // fallback anywhere in this file — if Gemini TTS fails, we stay silent
 // (text-only) rather than ever using the robotic browser voice.
 const TTS_VOICE_NAME = "Leda";
-
 
 const CONV_STORAGE_KEY = "jarvis_conversations";
 const MEMORY_STORAGE_KEY = "jarvis_memory";
@@ -238,7 +243,7 @@ function buildSystemInstruction(
     "4. open_link(url: string, title?: string) — opens a specific URL right inside the app's own Browser panel (not a new browser tab). Use this whenever the user asks you to open a link, a website, or a page they name or that came up earlier in the conversation, including 'tell me about this site' style requests where opening it helps.",
     "5. close_link(target?: string) — closes a tab in the app's Browser panel that was previously opened with open_link. If the user just says 'close it', 'close that', or 'close the tab', call this with no target and it closes the most recently opened one. If the user names which site (e.g. 'close the Wikipedia one'), pass that name or word as target so the right tab closes even if more than one is open.",
     "6. write_code(code: string, language?: string, filename?: string) — puts code into the on-screen code editor panel instead of speaking it. Use this whenever the user asks you to write, generate, debug, fix, or add a feature to code, or when they paste code and ask for changes. Always return the FULL updated code in the code argument, not just a snippet or diff.",
-    "7. build_app(html: string, title?: string) — use this whenever the user asks you to build them an app, a website, a tool, or anything they want to actually see running and interact with (not just a code snippet). The html argument must be ONE complete, self-contained HTML document starting with <!DOCTYPE html>, with all JS in a <script> tag inline — no build step, no import statements, no external files EXCEPT you may add exactly one <script src=\"https://cdn.tailwindcss.com\"></script> in the <head> and then style everything with Tailwind utility classes instead of hand-written CSS, since that CDN script needs no build step and runs entirely in the browser. If you use it, do not also write a separate <style> block for the same elements — pick Tailwind classes or plain CSS in <style>, not a mix for the same component. Whichever you use, make it look genuinely designed: a real color palette (not just default black-on-white), deliberate spacing and type hierarchy, and rounded/shadowed cards or buttons where they fit the app — avoid the bare, unstyled look of a first draft. Keep it fully working with no placeholders. This opens a live preview and a link the user can open in a new tab.",
+    '7. build_app(html: string, title?: string) — use this whenever the user asks you to build them an app, a website, a tool, or anything they want to actually see running and interact with (not just a code snippet). The html argument must be ONE complete, self-contained HTML document starting with <!DOCTYPE html>, with all JS in a <script> tag inline — no build step, no import statements, no external files EXCEPT you may add exactly one <script src="https://cdn.tailwindcss.com"></script> in the <head> and then style everything with Tailwind utility classes instead of hand-written CSS, since that CDN script needs no build step and runs entirely in the browser. If you use it, do not also write a separate <style> block for the same elements — pick Tailwind classes or plain CSS in <style>, not a mix for the same component. Whichever you use, make it look genuinely designed: a real color palette (not just default black-on-white), deliberate spacing and type hierarchy, and rounded/shadowed cards or buttons where they fit the app — avoid the bare, unstyled look of a first draft. Keep it fully working with no placeholders. This opens a live preview and a link the user can open in a new tab.',
     "8. make_file(content: string, filename?: string) — use this whenever the user asks you to write something they clearly want as a downloadable file rather than a spoken reply or code to run: a document, a report, a letter, notes, a CSV, a list, a plain text or markdown file, etc. Give the filename a sensible extension (e.g. notes.md, data.csv, letter.txt) so it downloads as the right file type. Always return the FULL file content, not a partial draft. This opens a panel with a download link and a copy button.",
     '9. open_panel(panel: "history"|"code"|"app"|"files"|"browser"|"settings") — opens one of the app\'s own side panels hands-free: "history" (chat history + memory + teacher mode toggle), "code" (code editor), "app" (app preview), "files" (downloadable file output), "browser" (the in-app web browser tabs), "settings" (the list of native apps you\'re allowed to open/close). Use this whenever the user says things like "open the history tab", "show me the code panel", "open the app preview", "show my files", "open the browser panel", "show me which apps you can control", etc. This is for the app\'s own UI panels, NOT for external websites (use open_link) and NOT for native desktop apps (use open_app).',
     '10. close_panel(panel?: "history"|"code"|"app"|"files"|"browser"|"settings") — closes one of the app\'s own side panels. If the user just says "close this panel" or "close it" without naming one, call this with no panel argument and it closes whatever is currently open. If they name a specific panel, pass it so the right one closes.',
@@ -305,10 +310,18 @@ interface GeminiPart {
   inlineData?: { data?: string; mimeType?: string };
 }
 
+interface GeminiGroundingChunk {
+  web?: { uri?: string; title?: string };
+}
+
+interface GeminiGroundingMetadata {
+  groundingChunks?: GeminiGroundingChunk[];
+}
+
 interface GeminiResponse {
   candidates?: {
     content?: { parts?: GeminiPart[] };
-    groundingMetadata?: any;
+    groundingMetadata?: GeminiGroundingMetadata;
   }[];
 }
 
@@ -332,7 +345,7 @@ function extractFinalAnswer(json: GeminiResponse): string {
 // model in the chain failed.
 async function callGeminiWithFallback(
   preferredModels: string[],
-  payload: Record<string, any>,
+  payload: Record<string, unknown>,
 ): Promise<GeminiResponse | null> {
   const models = await resolveModelChain(preferredModels);
   let sawAnyAttempt = false;
@@ -408,7 +421,7 @@ interface ToolCall {
     | "close_panel"
     | "open_app"
     | "close_app";
-  arguments: Record<string, any>;
+  arguments: Record<string, unknown>;
 }
 
 function tryParseToolCall(text: string): ToolCall | null {
@@ -442,7 +455,7 @@ function loadTasks(): StoredTask[] {
 function saveTasks(tasks: StoredTask[]) {
   localStorage.setItem(TASKS_STORAGE_KEY, JSON.stringify(tasks));
 }
-async function manageTasks(args: Record<string, any>): Promise<string> {
+async function manageTasks(args: Record<string, unknown>): Promise<string> {
   const { action, title, task_id } = args;
   const tasks = loadTasks();
   if (action === "add") {
@@ -485,7 +498,7 @@ async function manageTasks(args: Record<string, any>): Promise<string> {
 // brief (with sources) locally, and opens the top source in a new tab.
 // may still swallow the window.open — that's a browser limitation, not a bug
 // here. If it gets blocked, the link is still returned in the reply/brief.
-async function researchIdea(args: Record<string, any>): Promise<string> {
+async function researchIdea(args: Record<string, unknown>): Promise<string> {
   const { idea } = args;
   if (!idea || !String(idea).trim()) return "No idea given to research.";
 
@@ -515,8 +528,8 @@ async function researchIdea(args: Record<string, any>): Promise<string> {
 
     const chunks = candidate?.groundingMetadata?.groundingChunks ?? [];
     const links: { uri: string; title?: string }[] = chunks
-      .map((c: any) => c.web)
-      .filter((w: any) => w?.uri)
+      .map((c) => c.web)
+      .filter((w): w is { uri: string; title?: string } => Boolean(w?.uri))
       .slice(0, 3);
 
     // Only auto-open the single top source — opening several at once is far
@@ -530,8 +543,14 @@ async function researchIdea(args: Record<string, any>): Promise<string> {
     }
 
     const brief = { idea, summary, sources: links };
-    const briefs = JSON.parse(localStorage.getItem(RESEARCH_STORAGE_KEY) || "[]");
-    briefs.push({ idea_text: idea, brief, created_at: new Date().toISOString() });
+    const briefs = JSON.parse(
+      localStorage.getItem(RESEARCH_STORAGE_KEY) || "[]",
+    );
+    briefs.push({
+      idea_text: idea,
+      brief,
+      created_at: new Date().toISOString(),
+    });
     localStorage.setItem(RESEARCH_STORAGE_KEY, JSON.stringify(briefs));
 
     const sourceNote = links.length
@@ -588,7 +607,7 @@ function extractCodeBlock(
   return { code, language, cleanText };
 }
 
-async function rememberFact(args: Record<string, any>): Promise<string> {
+async function rememberFact(args: Record<string, unknown>): Promise<string> {
   const { fact } = args;
   if (!fact || !String(fact).trim()) return "No fact given to remember.";
   const cleanFact = String(fact).trim();
@@ -1049,7 +1068,7 @@ function Assistant() {
   // can't be edited by anything other than the native "pick an app" dialog.
   const [showSettings, setShowSettings] = useState(false);
   const [allowedApps, setAllowedApps] = useState<AllowedApp[]>([]);
-  const [isDesktopApp, setIsDesktopApp] = useState(false);
+  const [isDesktopApp] = useState(() => Boolean(window.electronAPI));
 
   const refreshAllowedApps = useCallback(async () => {
     if (!window.electronAPI) return;
@@ -1062,14 +1081,16 @@ function Assistant() {
   }, []);
 
   useEffect(() => {
-    setIsDesktopApp(Boolean(window.electronAPI));
+    // Fetches the allowed-apps list from the Electron main process (an
+    // external system) and stores the result — exactly what effects are for.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     refreshAllowedApps();
   }, [refreshAllowedApps]);
 
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [listening, setListening] = useState(false);
-  const [voiceSupported, setVoiceSupported] = useState(true);
+  const [voiceSupported] = useState(() => getSpeechRecognition() !== null);
   const [recognitionLang, setRecognitionLang] = useState<"en-US" | "sw-KE">(
     "en-US",
   );
@@ -1083,10 +1104,6 @@ function Assistant() {
   useEffect(() => {
     callActiveRef.current = callActive;
   }, [callActive]);
-
-  useEffect(() => {
-    setVoiceSupported(getSpeechRecognition() !== null);
-  }, []);
 
   useEffect(() => {
     return () => {
@@ -1103,6 +1120,9 @@ function Assistant() {
   // saved until they actually have content, so "New Chat" doesn't spam the
   // sidebar with blank entries.
   useEffect(() => {
+    // Synchronizes React state with an external system (localStorage) —
+    // exactly the case the rule's own docs call out as legitimate.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setConversations((prev) => {
       const idx = prev.findIndex((c) => c.id === currentConversationId);
       if (idx === -1 && messages.length === 0) return prev;
@@ -1245,7 +1265,8 @@ function Assistant() {
         const id = u.searchParams.get("v");
         if (id) return `https://www.youtube.com/embed/${id}`;
         const shortsMatch = u.pathname.match(/^\/shorts\/([\w-]+)/);
-        if (shortsMatch) return `https://www.youtube.com/embed/${shortsMatch[1]}`;
+        if (shortsMatch)
+          return `https://www.youtube.com/embed/${shortsMatch[1]}`;
       }
       if (host === "youtu.be") {
         const id = u.pathname.replace(/^\//, "");
@@ -1273,7 +1294,7 @@ function Assistant() {
     "linkedin.com",
   ];
 
-  function openLinkInApp(args: Record<string, any>): string {
+  function openLinkInApp(args: Record<string, unknown>): string {
     const { url, title } = args;
     if (!url || !String(url).trim()) return "No URL given to open.";
     const rawUrl = String(url).trim();
@@ -1300,7 +1321,7 @@ function Assistant() {
     return `Opened ${tab.title} right here in the browser panel.`;
   }
 
-  function closeLinkInApp(args: Record<string, any>): string {
+  function closeLinkInApp(args: Record<string, unknown>): string {
     const { target } = args;
     const tabs = browserTabs;
     if (tabs.length === 0) return "There's no tab open to close.";
@@ -1347,7 +1368,7 @@ function Assistant() {
     );
   }
 
-  async function openAppInApp(args: Record<string, any>): Promise<string> {
+  async function openAppInApp(args: Record<string, unknown>): Promise<string> {
     const { name } = args;
     if (!name || !String(name).trim()) return "No app name given to open.";
     if (!window.electronAPI) {
@@ -1366,7 +1387,7 @@ function Assistant() {
     }
   }
 
-  async function closeAppInApp(args: Record<string, any>): Promise<string> {
+  async function closeAppInApp(args: Record<string, unknown>): Promise<string> {
     const { name } = args;
     if (!name || !String(name).trim()) return "No app name given to close.";
     if (!window.electronAPI) {
@@ -1885,21 +1906,31 @@ function Assistant() {
           </div>
           <button
             onClick={toggleHistory}
-            aria-label={showHistory ? "Close history panel" : "Open history panel"}
+            aria-label={
+              showHistory ? "Close history panel" : "Open history panel"
+            }
             className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
           >
             ☰ <span className="hidden sm:inline">History</span>
           </button>
           <button
             onClick={toggleCodeEditor}
-            aria-label={showCodeEditor ? "Close code editor panel" : "Open code editor panel"}
+            aria-label={
+              showCodeEditor
+                ? "Close code editor panel"
+                : "Open code editor panel"
+            }
             className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
           >
             {"</>"} <span className="hidden sm:inline">Code</span>
           </button>
           <button
             onClick={toggleAppPreview}
-            aria-label={showAppPreview ? "Close app preview panel" : "Open app preview panel"}
+            aria-label={
+              showAppPreview
+                ? "Close app preview panel"
+                : "Open app preview panel"
+            }
             className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
           >
             ▶ <span className="hidden sm:inline">App</span>
@@ -1915,12 +1946,16 @@ function Assistant() {
           >
             🌐 <span className="hidden sm:inline">Browser</span>
             {browserTabs.length > 0 && (
-              <span className="ml-1 text-[#3ddcff]">({browserTabs.length})</span>
+              <span className="ml-1 text-[#3ddcff]">
+                ({browserTabs.length})
+              </span>
             )}
           </button>
           <button
             onClick={toggleFileOutput}
-            aria-label={showFileOutput ? "Close files panel" : "Open files panel"}
+            aria-label={
+              showFileOutput ? "Close files panel" : "Open files panel"
+            }
             className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
           >
             ⬇ <span className="hidden sm:inline">Files</span>
@@ -1928,7 +1963,9 @@ function Assistant() {
           {isDesktopApp && (
             <button
               onClick={toggleSettings}
-              aria-label={showSettings ? "Close settings panel" : "Open settings panel"}
+              aria-label={
+                showSettings ? "Close settings panel" : "Open settings panel"
+              }
               className="px-2.5 sm:px-3 py-1.5 sm:py-2 text-[9px] sm:text-[10px] font-bold tracking-[0.15em] sm:tracking-[0.2em] uppercase border border-[#1c5578] text-[#8fe3ff] hover:border-[#3ddcff] transition-colors whitespace-nowrap"
             >
               ⚙ <span className="hidden sm:inline">Settings</span>
@@ -2289,10 +2326,9 @@ function Assistant() {
             </div>
 
             <p className="text-[9px] text-[#3d6b85] leading-relaxed">
-              Some sites block being shown inside another page and will
-              appear blank here — use "Open externally" for those. Say
-              "close it" or "close the [site name] one" to close a tab hands
-              free.
+              Some sites block being shown inside another page and will appear
+              blank here — use "Open externally" for those. Say "close it" or
+              "close the [site name] one" to close a tab hands free.
             </p>
           </div>
         )}
@@ -2318,9 +2354,9 @@ function Assistant() {
                 Apps Jarvis can open or close
               </span>
               <p className="mt-1 text-[10px] text-[#3d6b85] leading-relaxed">
-                Only apps on this list can be opened or closed by voice or
-                chat — nothing else. Closing an app force-quits it, same as
-                ending its task; save your work first.
+                Only apps on this list can be opened or closed by voice or chat
+                — nothing else. Closing an app force-quits it, same as ending
+                its task; save your work first.
               </p>
             </div>
 

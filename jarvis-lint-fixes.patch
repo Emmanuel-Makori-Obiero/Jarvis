@@ -1,0 +1,193 @@
+diff --git a/src/pages/Assistant.tsx b/src/pages/Assistant.tsx
+index dcf94fd..1183136 100644
+--- a/src/pages/Assistant.tsx
++++ b/src/pages/Assistant.tsx
+@@ -52,6 +52,11 @@ const RESEARCH_MODEL_CHAIN_PREFERRED = [
+ // to only those. If the discovery call itself fails (network, key issue),
+ // we fall back to trying the hardcoded preferred lists as-is, so the app
+ // still works even if this lookup can't run.
++interface GeminiModelListEntry {
++  name?: string;
++  supportedGenerationMethods?: string[];
++}
++
+ let availableModelIdsCache: string[] | null = null;
+ let availableModelIdsPromise: Promise<string[]> | null = null;
+ 
+@@ -72,11 +77,12 @@ async function getAvailableModelIds(): Promise<string[]> {
+         );
+         return [];
+       }
+-      const ids: string[] = (json.models ?? [])
+-        .filter((m: any) =>
++      const models: GeminiModelListEntry[] = json.models ?? [];
++      const ids: string[] = models
++        .filter((m) =>
+           (m.supportedGenerationMethods ?? []).includes("generateContent"),
+         )
+-        .map((m: any) => String(m.name ?? "").replace(/^models\//, ""))
++        .map((m) => String(m.name ?? "").replace(/^models\//, ""))
+         .filter(Boolean);
+       console.log("Models available to this API key:", ids);
+       availableModelIdsCache = ids;
+@@ -305,10 +311,18 @@ interface GeminiPart {
+   inlineData?: { data?: string; mimeType?: string };
+ }
+ 
++interface GeminiGroundingChunk {
++  web?: { uri?: string; title?: string };
++}
++
++interface GeminiGroundingMetadata {
++  groundingChunks?: GeminiGroundingChunk[];
++}
++
+ interface GeminiResponse {
+   candidates?: {
+     content?: { parts?: GeminiPart[] };
+-    groundingMetadata?: any;
++    groundingMetadata?: GeminiGroundingMetadata;
+   }[];
+ }
+ 
+@@ -332,7 +346,7 @@ function extractFinalAnswer(json: GeminiResponse): string {
+ // model in the chain failed.
+ async function callGeminiWithFallback(
+   preferredModels: string[],
+-  payload: Record<string, any>,
++  payload: Record<string, unknown>,
+ ): Promise<GeminiResponse | null> {
+   const models = await resolveModelChain(preferredModels);
+   let sawAnyAttempt = false;
+@@ -408,7 +422,7 @@ interface ToolCall {
+     | "close_panel"
+     | "open_app"
+     | "close_app";
+-  arguments: Record<string, any>;
++  arguments: Record<string, unknown>;
+ }
+ 
+ function tryParseToolCall(text: string): ToolCall | null {
+@@ -442,7 +456,7 @@ function loadTasks(): StoredTask[] {
+ function saveTasks(tasks: StoredTask[]) {
+   localStorage.setItem(TASKS_STORAGE_KEY, JSON.stringify(tasks));
+ }
+-async function manageTasks(args: Record<string, any>): Promise<string> {
++async function manageTasks(args: Record<string, unknown>): Promise<string> {
+   const { action, title, task_id } = args;
+   const tasks = loadTasks();
+   if (action === "add") {
+@@ -485,7 +499,7 @@ async function manageTasks(args: Record<string, any>): Promise<string> {
+ // brief (with sources) locally, and opens the top source in a new tab.
+ // may still swallow the window.open — that's a browser limitation, not a bug
+ // here. If it gets blocked, the link is still returned in the reply/brief.
+-async function researchIdea(args: Record<string, any>): Promise<string> {
++async function researchIdea(args: Record<string, unknown>): Promise<string> {
+   const { idea } = args;
+   if (!idea || !String(idea).trim()) return "No idea given to research.";
+ 
+@@ -515,8 +529,8 @@ async function researchIdea(args: Record<string, any>): Promise<string> {
+ 
+     const chunks = candidate?.groundingMetadata?.groundingChunks ?? [];
+     const links: { uri: string; title?: string }[] = chunks
+-      .map((c: any) => c.web)
+-      .filter((w: any) => w?.uri)
++      .map((c) => c.web)
++      .filter((w): w is { uri: string; title?: string } => Boolean(w?.uri))
+       .slice(0, 3);
+ 
+     // Only auto-open the single top source — opening several at once is far
+@@ -588,7 +602,7 @@ function extractCodeBlock(
+   return { code, language, cleanText };
+ }
+ 
+-async function rememberFact(args: Record<string, any>): Promise<string> {
++async function rememberFact(args: Record<string, unknown>): Promise<string> {
+   const { fact } = args;
+   if (!fact || !String(fact).trim()) return "No fact given to remember.";
+   const cleanFact = String(fact).trim();
+@@ -1049,7 +1063,7 @@ function Assistant() {
+   // can't be edited by anything other than the native "pick an app" dialog.
+   const [showSettings, setShowSettings] = useState(false);
+   const [allowedApps, setAllowedApps] = useState<AllowedApp[]>([]);
+-  const [isDesktopApp, setIsDesktopApp] = useState(false);
++  const [isDesktopApp] = useState(() => Boolean(window.electronAPI));
+ 
+   const refreshAllowedApps = useCallback(async () => {
+     if (!window.electronAPI) return;
+@@ -1062,14 +1076,16 @@ function Assistant() {
+   }, []);
+ 
+   useEffect(() => {
+-    setIsDesktopApp(Boolean(window.electronAPI));
++    // Fetches the allowed-apps list from the Electron main process (an
++    // external system) and stores the result — exactly what effects are for.
++    // eslint-disable-next-line react-hooks/set-state-in-effect
+     refreshAllowedApps();
+   }, [refreshAllowedApps]);
+ 
+   const [input, setInput] = useState("");
+   const [loading, setLoading] = useState(false);
+   const [listening, setListening] = useState(false);
+-  const [voiceSupported, setVoiceSupported] = useState(true);
++  const [voiceSupported] = useState(() => getSpeechRecognition() !== null);
+   const [recognitionLang, setRecognitionLang] = useState<"en-US" | "sw-KE">(
+     "en-US",
+   );
+@@ -1084,10 +1100,6 @@ function Assistant() {
+     callActiveRef.current = callActive;
+   }, [callActive]);
+ 
+-  useEffect(() => {
+-    setVoiceSupported(getSpeechRecognition() !== null);
+-  }, []);
+-
+   useEffect(() => {
+     return () => {
+       if (streamTimerRef.current) clearInterval(streamTimerRef.current);
+@@ -1103,6 +1115,9 @@ function Assistant() {
+   // saved until they actually have content, so "New Chat" doesn't spam the
+   // sidebar with blank entries.
+   useEffect(() => {
++    // Synchronizes React state with an external system (localStorage) —
++    // exactly the case the rule's own docs call out as legitimate.
++    // eslint-disable-next-line react-hooks/set-state-in-effect
+     setConversations((prev) => {
+       const idx = prev.findIndex((c) => c.id === currentConversationId);
+       if (idx === -1 && messages.length === 0) return prev;
+@@ -1273,7 +1288,7 @@ function Assistant() {
+     "linkedin.com",
+   ];
+ 
+-  function openLinkInApp(args: Record<string, any>): string {
++  function openLinkInApp(args: Record<string, unknown>): string {
+     const { url, title } = args;
+     if (!url || !String(url).trim()) return "No URL given to open.";
+     const rawUrl = String(url).trim();
+@@ -1300,7 +1315,7 @@ function Assistant() {
+     return `Opened ${tab.title} right here in the browser panel.`;
+   }
+ 
+-  function closeLinkInApp(args: Record<string, any>): string {
++  function closeLinkInApp(args: Record<string, unknown>): string {
+     const { target } = args;
+     const tabs = browserTabs;
+     if (tabs.length === 0) return "There's no tab open to close.";
+@@ -1347,7 +1362,7 @@ function Assistant() {
+     );
+   }
+ 
+-  async function openAppInApp(args: Record<string, any>): Promise<string> {
++  async function openAppInApp(args: Record<string, unknown>): Promise<string> {
+     const { name } = args;
+     if (!name || !String(name).trim()) return "No app name given to open.";
+     if (!window.electronAPI) {
+@@ -1366,7 +1381,7 @@ function Assistant() {
+     }
+   }
+ 
+-  async function closeAppInApp(args: Record<string, any>): Promise<string> {
++  async function closeAppInApp(args: Record<string, unknown>): Promise<string> {
+     const { name } = args;
+     if (!name || !String(name).trim()) return "No app name given to close.";
+     if (!window.electronAPI) {
