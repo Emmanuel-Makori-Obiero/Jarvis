@@ -12,6 +12,16 @@ const isDev = !app.isPackaged;
 let mainWindow = null;
 let teacherWindow = null;
 
+// A standing human is roughly 3-4x taller than wide. A square window
+// (the old 320x320) forces the camera to crop either the head or the
+// feet to fit that shape — hence "only half the body showing". Portrait
+// dimensions let the model's full bounding box actually fit on screen.
+// Hoisted to module scope (not just local to createTeacherWindow) so the
+// move-by/set-position handlers below can re-assert this exact size on
+// every call — see the "growing while walking" note near those handlers.
+const TEACHER_WIN_WIDTH = 130;
+const TEACHER_WIN_HEIGHT = 220;
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -40,13 +50,12 @@ function createWindow() {
 // TeacherOverlay's markup.
 function createTeacherWindow() {
   const { width, height } = screen.getPrimaryDisplay().workAreaSize;
-  const size = 320;
 
   teacherWindow = new BrowserWindow({
-    width: size,
-    height: size,
-    x: width - size - 40,
-    y: height - size - 40,
+    width: TEACHER_WIN_WIDTH,
+    height: TEACHER_WIN_HEIGHT,
+    x: width - TEACHER_WIN_WIDTH - 40,
+    y: height - TEACHER_WIN_HEIGHT - 40,
     transparent: true,
     frame: false,
     alwaysOnTop: true,
@@ -62,11 +71,45 @@ function createTeacherWindow() {
 
   teacherWindow.setAlwaysOnTop(true, 'screen-saver');
 
+  // `resizable: false` is supposed to make this a no-op guarantee, but in
+  // practice the window's actual pixel content size was measured (via the
+  // renderer's own canvas.width/height) to keep climbing continuously for
+  // as long as the autonomous walk loop kept calling setPosition() —
+  // something in the OS/window-manager layer was renegotiating size on
+  // every move despite the flag, and it never snapped back on its own.
+  // Belt-and-suspenders fix: whenever a 'resize' event fires for ANY
+  // reason, immediately force the size back to the fixed dimensions
+  // rather than trusting resizable:false alone to prevent it.
+  teacherWindow.on('resize', () => {
+    if (!teacherWindow) return;
+    const [w, h] = teacherWindow.getSize();
+    if (w !== TEACHER_WIN_WIDTH || h !== TEACHER_WIN_HEIGHT) {
+      const [x, y] = teacherWindow.getPosition();
+      teacherWindow.setBounds({ x, y, width: TEACHER_WIN_WIDTH, height: TEACHER_WIN_HEIGHT });
+    }
+  });
+
+  // Transparent + frameless does NOT make a window click-through by
+  // itself — without this call the window's full rectangle (including
+  // the fully transparent pixels around the avatar) still captures every
+  // mouse event at the OS level, which is why hovering anywhere over the
+  // little window blocked clicks/scrolls to whatever app was underneath
+  // it. `forward: true` keeps mousemove/mouseenter/mouseleave reaching
+  // the renderer even while ignoring, so it can still detect when the
+  // cursor is actually over the character (see TeacherOverlay.tsx) and
+  // temporarily disable ignoring for that case.
+  teacherWindow.setIgnoreMouseEvents(true, { forward: true });
+
   if (isDev) {
     teacherWindow.loadURL('http://localhost:5173/teacher.html');
   } else {
     teacherWindow.loadFile(path.join(__dirname, '..', 'dist', 'teacher.html'));
   }
+
+  // This window has no visible chrome to right-click on, so open devtools
+  // unconditionally (not just in dev) — otherwise asset/render errors here
+  // fail completely silently and just show as "nothing appeared".
+  teacherWindow.webContents.openDevTools({ mode: 'detach' });
 }
 
 app.whenReady().then(() => {
@@ -89,33 +132,61 @@ app.whenReady().then(() => {
 
   // Lets the overlay's drag handle move the actual OS window, since a
   // frameless transparent window has no native title bar to drag by.
-  // setPosition() is a native Electron binding that throws (crashing the
-  // whole main process, not just this handler) if given anything other
-  // than a finite integer — so we validate before calling it, rather than
-  // trusting whatever numbers the renderer sent over IPC.
+  // setBounds() (rather than setPosition()) also re-asserts the fixed
+  // width/height on every move — see the createTeacherWindow 'resize'
+  // watchdog note on why we no longer trust size to just stay put.
+  // Values are validated first since these native bindings throw
+  // (crashing the whole main process, not just this handler) given
+  // anything other than finite integers.
   ipcMain.on('teacher:move-by', (_event, dx, dy) => {
     if (!teacherWindow) return;
     if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
     const [x, y] = teacherWindow.getPosition();
-    teacherWindow.setPosition(Math.round(x + dx), Math.round(y + dy));
+    teacherWindow.setBounds({
+      x: Math.round(x + dx),
+      y: Math.round(y + dy),
+      width: TEACHER_WIN_WIDTH,
+      height: TEACHER_WIN_HEIGHT,
+    });
   });
 
   // Lets the overlay's autonomous walk logic know how far it can roam
   // (screen work area) and where it currently sits, so it can pick a
-  // random destination on-screen without wandering off it.
+  // random destination on-screen without wandering off it. Reports the
+  // fixed constants rather than teacherWindow.getSize() — that call can
+  // momentarily reflect a drifted size in the brief window between an
+  // unexpected resize and the 'resize' watchdog correcting it.
   ipcMain.handle('teacher:get-bounds', () => {
     const { width, height } = screen.getPrimaryDisplay().workAreaSize;
     const [x, y] = teacherWindow ? teacherWindow.getPosition() : [0, 0];
-    const [winWidth, winHeight] = teacherWindow ? teacherWindow.getSize() : [320, 320];
-    return { screenWidth: width, screenHeight: height, x, y, winWidth, winHeight };
+    return { screenWidth: width, screenHeight: height, x, y, winWidth: TEACHER_WIN_WIDTH, winHeight: TEACHER_WIN_HEIGHT };
   });
 
   // Same finite-number guard as teacher:move-by — this one sets an
-  // absolute position (used by the walk loop) rather than a delta.
+  // absolute position (used by the walk loop, every animation frame
+  // while walking) rather than a delta. setBounds pins width/height back
+  // to the fixed size on every single frame, which is what actually
+  // stops the continuous growth: the walk loop calls this dozens of
+  // times per second, so re-asserting size here closes the gap fast
+  // regardless of what's causing the drift upstream.
   ipcMain.on('teacher:set-position', (_event, x, y) => {
     if (!teacherWindow) return;
     if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-    teacherWindow.setPosition(Math.round(x), Math.round(y));
+    teacherWindow.setBounds({
+      x: Math.round(x),
+      y: Math.round(y),
+      width: TEACHER_WIN_WIDTH,
+      height: TEACHER_WIN_HEIGHT,
+    });
+  });
+
+  // Renderer-driven click-through toggle. `ignore: false` while the
+  // cursor is actually over the rendered avatar (or while dragging it) so
+  // it stays interactive; `ignore: true` the rest of the time so clicks
+  // fall through to the app underneath instead of hitting this window.
+  ipcMain.on('teacher:set-ignore-mouse', (_event, ignore) => {
+    if (!teacherWindow) return;
+    teacherWindow.setIgnoreMouseEvents(Boolean(ignore), { forward: true });
   });
 
   app.on('activate', () => {

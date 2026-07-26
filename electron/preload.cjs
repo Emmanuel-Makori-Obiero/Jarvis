@@ -34,4 +34,13 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Used by the autonomous walk loop to move the window to an absolute
   // screen position each animation frame while it "walks".
   setTeacherPosition: (x, y) => ipcRenderer.send("teacher:set-position", x, y),
+
+  // Lets the overlay toggle its own click-through behavior: `ignore: true`
+  // makes the OS pass clicks/scrolls straight through to whatever app is
+  // underneath the transparent window (so hovering empty space never
+  // steals focus from Word, a browser, etc). The renderer flips this
+  // based on real hit-testing against the avatar mesh, not just "mouse is
+  // somewhere over this window's rectangle".
+  setTeacherIgnoreMouseEvents: (ignore) =>
+    ipcRenderer.send("teacher:set-ignore-mouse", ignore),
 });
