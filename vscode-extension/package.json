@@ -1,0 +1,19 @@
+{
+  "name": "jarvis-vscode-bridge",
+  "displayName": "Jarvis VS Code Bridge",
+  "description": "Lets the Jarvis desktop assistant read the active file and apply edits in VS Code during a live voice call. Only Jarvis, running as a separate process on the same machine, can talk to this — no network exposure, no third party.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "jarvisBridge.status",
+        "title": "Jarvis Bridge: Show Connection Status"
+      }
+    ]
+  }
+}

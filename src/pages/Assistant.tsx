@@ -177,9 +177,33 @@ interface ElectronBridge {
   removeAllowedApp: (id: string) => Promise<void>;
   openApp: (id: string) => Promise<{ ok: boolean; message: string }>;
   closeApp: (id: string) => Promise<{ ok: boolean; message: string }>;
+  // The one exception to open/close-only: a local bridge to a VS Code
+  // extension (see electron/vscodeBridge.cjs) that can read the active
+  // file and apply edits. Scoped entirely to VS Code — no other app has
+  // anything like this.
+  vscode?: {
+    isConfigured: () => Promise<boolean>;
+    getContext: () => Promise<{
+      activeFile: string | null;
+      openFiles: string[];
+      fullText: string | null;
+      selectionText: string | null;
+      languageId: string | null;
+      cursorLine?: number;
+    }>;
+    replaceFile: (filePath: string | undefined, content: string) => Promise<{ filePath: string; saved: boolean }>;
+    insertAtCursor: (content: string) => Promise<{ filePath: string; saved: boolean }>;
+    getDiagnostics: () => Promise<{ diagnostics: { file: string; line: number; severity: string; message: string }[] }>;
+  };
   // Tells the floating teacher overlay window whether Jarvis is currently
   // speaking, so its avatar can switch between idle and talking animation.
   setTeacherSpeaking?: (speaking: boolean) => void;
+  // The teacher overlay's tiny "Talk to me" button asks the main window
+  // to start a call through this; the main window listens for it here.
+  onStartCallRequested?: (callback: () => void) => () => void;
+  // Lets the main window tell the teacher overlay what it just did, so
+  // the avatar can react with a caption + a little walk-over gesture.
+  announceToTeacher?: (text: string) => void;
 }
 declare global {
   interface Window {
@@ -239,7 +263,7 @@ function buildSystemInstruction(
     "You are given the FULL conversation history on every turn, including everything said earlier in this call or chat. Actually use it: remember names, numbers, decisions, and anything the user told you earlier in this same session, and refer back to them naturally when relevant. Never ask the user to repeat something they already told you earlier in this conversation — check the history first.",
     "When walking someone through a multi-step task (like programming or debugging), give ONE step at a time, keep it short, then explicitly ask something like 'let me know once you've done that' before moving to the next step. Never dump several steps at once during a live call.",
     "",
-    "You have twelve tools you can call:",
+    "You have fourteen tools you can call:",
     '1. manage_tasks(action: "add"|"list"|"complete"|"delete", title?: string, task_id?: string) — reads/writes the user\'s task list.',
     "2. research_idea(idea: string) — runs a real web search on a business idea, opens the top source in a new browser tab, and returns a short brief with citations.",
     "3. remember(fact: string) — saves a short, durable fact about the user (their name, preferences, ongoing projects, recurring context) so you can recall it in future conversations, even new ones. Call this whenever the user shares something worth remembering long-term. Do not call it for one-off details that only matter for this exchange.",
@@ -252,6 +276,8 @@ function buildSystemInstruction(
     '10. close_panel(panel?: "history"|"code"|"app"|"files"|"browser"|"settings") — closes one of the app\'s own side panels. If the user just says "close this panel" or "close it" without naming one, call this with no panel argument and it closes whatever is currently open. If they name a specific panel, pass it so the right one closes.',
     "11. open_app(name: string) — launches a native desktop application (not a website, not a panel). Only works in the desktop build of this app, and ONLY for apps the user has already added to their allowed-apps list in Settings — it will never attempt to launch anything not on that list, so if the user asks for something unfamiliar, just call it with their name as given and let the result tell you whether it's allowed. Use this for requests like 'open Spotify', 'launch my email client', 'start Photoshop'.",
     "12. close_app(name: string) — force-closes a native desktop application previously opened this way. This ends the app the same way force-quitting it would — any unsaved work in that app is lost, so if the user's request sounds ambiguous about which app, ask rather than guessing. Only works in the desktop build, and only for apps on the allowed-apps list.",
+    "13. read_vscode() — reads the file currently open in VS Code: its path, full text, current selection, and any editor problems/diagnostics. Use this ONLY after the user has explicitly asked, in this conversation, to open VS Code and have you look at or edit their code — never call it just because VS Code happens to be running, and never for any other app. Call it before edit_vscode so you know what's actually in the file rather than guessing.",
+    '13b. edit_vscode(content: string, mode: "replace"|"insert", filePath?: string) — applies a real edit inside VS Code, through the same explicit-request-only gate as read_vscode. "replace" overwrites the ENTIRE contents of the target file with content and saves it (always pass the full new file, never a diff or a snippet; if filePath is omitted it replaces whichever file is currently active). "insert" types content in at the user\'s current cursor position, or over their current selection, in the active file, then saves. This is the ONLY tool in the whole app that can change another application\'s file contents, and it only ever touches VS Code, and only when the user explicitly asked for that in this session — for every other app you may only open_app/close_app, never edit anything.',
     "When the user's request needs one of these, respond with ONLY strict JSON and nothing else, no markdown fences: ",
     '{"tool_call": {"name": "manage_tasks", "arguments": {"action": "add", "title": "..."}}}',
     "or",
@@ -276,6 +302,10 @@ function buildSystemInstruction(
     '{"tool_call": {"name": "open_app", "arguments": {"name": "Spotify"}}}',
     "or",
     '{"tool_call": {"name": "close_app", "arguments": {"name": "Spotify"}}}',
+    "or",
+    '{"tool_call": {"name": "read_vscode", "arguments": {}}}',
+    "or",
+    '{"tool_call": {"name": "edit_vscode", "arguments": {"content": "...", "mode": "replace"}}}',
     "Otherwise just respond normally in plain conversational text. Never read code out loud or paste large code blocks into a normal spoken reply — always use write_code or build_app for that and just briefly describe what you changed.",
     "If the user asks you to explain code (e.g. 'explain this' or 'walk me through every line'), do NOT call write_code and do NOT wrap anything in triple-backtick code fences — just explain it in plain conversational prose, referencing lines by what they do rather than quoting them verbatim, going through it in order from top to bottom.",
   ];
@@ -423,7 +453,9 @@ interface ToolCall {
     | "open_panel"
     | "close_panel"
     | "open_app"
-    | "close_app";
+    | "close_app"
+    | "read_vscode"
+    | "edit_vscode";
   arguments: Record<string, unknown>;
 }
 
@@ -1254,6 +1286,17 @@ function Assistant() {
     callActiveRef.current = callActive;
   }, [callActive]);
 
+  // The teacher overlay window's tiny "Talk to me" button has no call
+  // logic of its own — it just asks (via main.cjs) for this window to
+  // start one, same as clicking the in-app call button would.
+  useEffect(() => {
+    const unsubscribe = window.electronAPI?.onStartCallRequested?.(() => {
+      if (!callActiveRef.current) startCall();
+    });
+    return () => unsubscribe?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     return () => {
       if (streamTimerRef.current) clearInterval(streamTimerRef.current);
@@ -1555,6 +1598,59 @@ function Assistant() {
     }
   }
 
+  // ---- read_vscode / edit_vscode: the one content-editing exception ----
+  // These only ever talk to the local VS Code bridge extension (see
+  // electron/vscodeBridge.cjs) — no other app in the whitelist has an
+  // equivalent, and this module has no code path that reaches any other
+  // app's files.
+  async function readVscodeInApp(): Promise<string> {
+    if (!window.electronAPI?.vscode) {
+      return "Reading VS Code only works in the desktop version of this app.";
+    }
+    try {
+      const ctx = await window.electronAPI.vscode.getContext();
+      if (!ctx.activeFile) {
+        return "VS Code is connected but no file is currently open there.";
+      }
+      const diagResult = await window.electronAPI.vscode.getDiagnostics().catch(() => null);
+      const diagText = diagResult?.diagnostics?.length
+        ? `Problems: ${diagResult.diagnostics
+            .slice(0, 10)
+            .map((d) => `${d.severity} at line ${d.line + 1}: ${d.message}`)
+            .join("; ")}`
+        : "No problems reported.";
+      return [
+        `Active file: ${ctx.activeFile} (${ctx.languageId ?? "unknown language"}).`,
+        ctx.selectionText
+          ? `Current selection:\n${ctx.selectionText}`
+          : `Full file contents:\n${ctx.fullText ?? ""}`,
+        diagText,
+      ].join("\n\n");
+    } catch (err) {
+      return err instanceof Error ? err.message : "Couldn't read VS Code right now.";
+    }
+  }
+
+  async function editVscodeInApp(args: Record<string, unknown>): Promise<string> {
+    if (!window.electronAPI?.vscode) {
+      return "Editing VS Code only works in the desktop version of this app.";
+    }
+    const content = String(args.content ?? "");
+    const mode = args.mode === "insert" ? "insert" : "replace";
+    const filePath = args.filePath ? String(args.filePath) : undefined;
+    if (!content) return "No content given to write into VS Code.";
+    try {
+      if (mode === "insert") {
+        const result = await window.electronAPI.vscode.insertAtCursor(content);
+        return `Inserted the text at your cursor in ${result.filePath} and saved it.`;
+      }
+      const result = await window.electronAPI.vscode.replaceFile(filePath, content);
+      return `Updated ${result.filePath} with the new code and saved it.`;
+    } catch (err) {
+      return err instanceof Error ? err.message : "Couldn't apply that edit in VS Code.";
+    }
+  }
+
   async function addAllowedApp() {
     if (!window.electronAPI) return;
     try {
@@ -1615,8 +1711,16 @@ function Assistant() {
         toolResultText = closeLinkInApp(toolCall.arguments);
       } else if (toolCall.name === "open_app") {
         toolResultText = await openAppInApp(toolCall.arguments);
+        window.electronAPI?.announceToTeacher?.(toolResultText);
       } else if (toolCall.name === "close_app") {
         toolResultText = await closeAppInApp(toolCall.arguments);
+        window.electronAPI?.announceToTeacher?.(toolResultText);
+      } else if (toolCall.name === "read_vscode") {
+        toolResultText = await readVscodeInApp();
+        window.electronAPI?.announceToTeacher?.("Looking at your code in VS Code…");
+      } else if (toolCall.name === "edit_vscode") {
+        toolResultText = await editVscodeInApp(toolCall.arguments);
+        window.electronAPI?.announceToTeacher?.(toolResultText);
       } else if (toolCall.name === "write_code") {
         setPhase("coding");
         const { code, language, filename } = toolCall.arguments;

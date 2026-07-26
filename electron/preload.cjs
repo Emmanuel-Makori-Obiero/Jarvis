@@ -13,10 +13,41 @@ contextBridge.exposeInMainWorld("electronAPI", {
   openApp: (id) => ipcRenderer.invoke("apps:open", id),
   closeApp: (id) => ipcRenderer.invoke("apps:close", id),
 
+  // The one exception to "open/close only" — scoped entirely to VS Code,
+  // and entirely to the local bridge extension (see electron/vscodeBridge.cjs
+  // and vscode-extension/). Nothing here can touch any other app's files.
+  vscode: {
+    isConfigured: () => ipcRenderer.invoke("vscode:isConfigured"),
+    getContext: () => ipcRenderer.invoke("vscode:getContext"),
+    replaceFile: (filePath, content) =>
+      ipcRenderer.invoke("vscode:replaceFile", filePath, content),
+    insertAtCursor: (content) => ipcRenderer.invoke("vscode:insertAtCursor", content),
+    getDiagnostics: () => ipcRenderer.invoke("vscode:getDiagnostics"),
+  },
+
   // Used by the main chat window to tell the floating teacher overlay
   // when Jarvis starts/stops talking, so its avatar can animate.
   setTeacherSpeaking: (speaking) =>
     ipcRenderer.send("teacher:speak-state", speaking),
+
+  // Used by the teacher overlay's own tiny "Talk to me" button: asks the
+  // main window to start a call. Used by the main window to listen for it.
+  requestStartCall: () => ipcRenderer.send("teacher:start-call"),
+  onStartCallRequested: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on("teacher:start-call", handler);
+    return () => ipcRenderer.removeListener("teacher:start-call", handler);
+  },
+
+  // Used by the main window to tell the teacher overlay what it just did,
+  // so the avatar can walk over and show a short caption bubble. Used by
+  // the teacher overlay to receive that text.
+  announceToTeacher: (text) => ipcRenderer.send("teacher:announce", text),
+  onTeacherAnnounce: (callback) => {
+    const handler = (_event, text) => callback(text);
+    ipcRenderer.on("teacher:announce", handler);
+    return () => ipcRenderer.removeListener("teacher:announce", handler);
+  },
 
   // Used by the teacher overlay itself to receive that state, and to
   // drag its own (frameless, native-title-bar-less) window around.

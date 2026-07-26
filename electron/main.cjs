@@ -7,6 +7,7 @@ const {
   openAllowedApp,
   closeAllowedApp,
 } = require('./appControl.cjs');
+const vscodeBridge = require('./vscodeBridge.cjs');
 
 const isDev = !app.isPackaged;
 let mainWindow = null;
@@ -38,8 +39,6 @@ function createWindow() {
   } else {
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
   }
-
-  mainWindow.webContents.openDevTools();
 }
 
 // The floating teacher lives in its own transparent, frameless,
@@ -124,10 +123,42 @@ app.whenReady().then(() => {
   ipcMain.handle('apps:open', (_event, id) => openAllowedApp(id));
   ipcMain.handle('apps:close', (_event, id) => closeAllowedApp(id));
 
+  // The one content-editing exception, scoped entirely to the VS Code
+  // bridge extension over localhost — see vscodeBridge.cjs. Every handler
+  // here just forwards to that module and lets its own errors (bridge not
+  // running, no file open, etc.) surface as rejected promises, which the
+  // renderer turns into a spoken explanation rather than a crash.
+  ipcMain.handle('vscode:isConfigured', () => vscodeBridge.isConfigured());
+  ipcMain.handle('vscode:getContext', () => vscodeBridge.getContext());
+  ipcMain.handle('vscode:replaceFile', (_event, filePath, content) =>
+    vscodeBridge.replaceFile(filePath, content),
+  );
+  ipcMain.handle('vscode:insertAtCursor', (_event, content) =>
+    vscodeBridge.insertAtCursor(content),
+  );
+  ipcMain.handle('vscode:getDiagnostics', () => vscodeBridge.getDiagnostics());
+
   // Relay: main app window says "I'm speaking" / "I'm done" -> forwarded
   // to the teacher overlay window so its avatar can animate accordingly.
   ipcMain.on('teacher:speak-state', (_event, speaking) => {
     teacherWindow?.webContents.send('teacher:speak-state', speaking);
+  });
+
+  // Relay: the tiny "Talk to me" button lives in the teacher overlay
+  // window, but the actual call/mic/voice logic lives in the main
+  // window's React tree. The main window is already running in the
+  // background (it's created at startup, just like this one) — we only
+  // need to tell it to start a call, not show or focus it, so the user
+  // only ever sees/hears the floating character, not the app window.
+  ipcMain.on('teacher:start-call', () => {
+    mainWindow?.webContents.send('teacher:start-call');
+  });
+
+  // Relay: the main window tells the teacher overlay what it just did
+  // (opened an app, applied a VS Code edit, etc.) so the avatar can walk
+  // over and show a short caption — see TeacherOverlay.tsx.
+  ipcMain.on('teacher:announce', (_event, text) => {
+    teacherWindow?.webContents.send('teacher:announce', text);
   });
 
   // Lets the overlay's drag handle move the actual OS window, since a
