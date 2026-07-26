@@ -12,4 +12,18 @@ contextBridge.exposeInMainWorld("electronAPI", {
   removeAllowedApp: (id) => ipcRenderer.invoke("apps:remove", id),
   openApp: (id) => ipcRenderer.invoke("apps:open", id),
   closeApp: (id) => ipcRenderer.invoke("apps:close", id),
+
+  // Used by the main chat window to tell the floating teacher overlay
+  // when Jarvis starts/stops talking, so its avatar can animate.
+  setTeacherSpeaking: (speaking) =>
+    ipcRenderer.send("teacher:speak-state", speaking),
+
+  // Used by the teacher overlay itself to receive that state, and to
+  // drag its own (frameless, native-title-bar-less) window around.
+  onTeacherSpeakState: (callback) => {
+    const handler = (_event, speaking) => callback(speaking);
+    ipcRenderer.on("teacher:speak-state", handler);
+    return () => ipcRenderer.removeListener("teacher:speak-state", handler);
+  },
+  moveTeacherWindowBy: (dx, dy) => ipcRenderer.send("teacher:move-by", dx, dy),
 });

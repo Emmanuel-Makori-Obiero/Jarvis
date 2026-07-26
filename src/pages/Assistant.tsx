@@ -177,6 +177,9 @@ interface ElectronBridge {
   removeAllowedApp: (id: string) => Promise<void>;
   openApp: (id: string) => Promise<{ ok: boolean; message: string }>;
   closeApp: (id: string) => Promise<{ ok: boolean; message: string }>;
+  // Tells the floating teacher overlay window whether Jarvis is currently
+  // speaking, so its avatar can switch between idle and talking animation.
+  setTeacherSpeaking?: (speaking: boolean) => void;
 }
 declare global {
   interface Window {
@@ -898,9 +901,9 @@ async function prepareSpeech(text: string): Promise<HTMLAudioElement | null> {
 function micInputSupported(): boolean {
   return Boolean(
     typeof navigator !== "undefined" &&
-    navigator.mediaDevices &&
-    typeof navigator.mediaDevices.getUserMedia === "function" &&
-    typeof MediaRecorder !== "undefined",
+      navigator.mediaDevices &&
+      typeof navigator.mediaDevices.getUserMedia === "function" &&
+      typeof MediaRecorder !== "undefined",
   );
 }
 
@@ -1113,11 +1116,16 @@ function playAndWait(audio: HTMLAudioElement | null): Promise<void> {
       resolve();
       return;
     }
-    audio.onended = () => resolve();
-    audio.onerror = (e) => {
-      console.error("Audio element error during playback:", e);
+    const finish = () => {
+      window.electronAPI?.setTeacherSpeaking?.(false);
       resolve();
     };
+    audio.onended = finish;
+    audio.onerror = (e) => {
+      console.error("Audio element error during playback:", e);
+      finish();
+    };
+    window.electronAPI?.setTeacherSpeaking?.(true);
     const playPromise = audio.play();
     if (playPromise && typeof playPromise.catch === "function") {
       playPromise.catch((err) => {
@@ -1126,7 +1134,7 @@ function playAndWait(audio: HTMLAudioElement | null): Promise<void> {
             "Click anywhere on the page once, or interact with the Talk button first, then try again.",
           err,
         );
-        resolve();
+        finish();
       });
     }
   });

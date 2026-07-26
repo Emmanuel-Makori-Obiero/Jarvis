@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Jarvis Teacher</title>
+    <style>
+      /* The overlay window itself is transparent (set at the Electron
+         BrowserWindow level); these just make sure nothing paints an
+         opaque background over that transparency. */
+      html, body, #teacher-root {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="teacher-root"></div>
+    <script type="module" src="/src/teacher-main.tsx"></script>
+  </body>
+</html>
