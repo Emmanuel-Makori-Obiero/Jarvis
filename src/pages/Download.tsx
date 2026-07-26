@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactElement } from "react";
 
 type ReleaseAsset = {
   name: string;
@@ -18,7 +18,7 @@ type Platform = {
   name: string;
   detail: string;
   fallbackHref: string;
-  icon: JSX.Element;
+  icon: ReactElement;
   matchers: RegExp[];
 };
 

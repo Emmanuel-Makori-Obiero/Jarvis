@@ -456,7 +456,9 @@ function saveTasks(tasks: StoredTask[]) {
   localStorage.setItem(TASKS_STORAGE_KEY, JSON.stringify(tasks));
 }
 async function manageTasks(args: Record<string, unknown>): Promise<string> {
-  const { action, title, task_id } = args;
+  const action = args.action as string | undefined;
+  const title = String(args.title ?? "");
+  const task_id = args.task_id as string | undefined;
   const tasks = loadTasks();
   if (action === "add") {
     const task: StoredTask = {
@@ -776,6 +778,17 @@ function base64ToUint8Array(base64: string): Uint8Array {
   return bytes;
 }
 
+// Used to upload recorded mic audio to Gemini for transcription.
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000; // avoid call-stack blowup on big buffers
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
 // Gemini TTS returns raw 16-bit PCM mono audio at 24kHz with no header,
 // so we wrap it in a minimal WAV header ourselves before playback.
 function pcmToWavBlob(pcmBytes: Uint8Array, sampleRate = 24000): Blob {
@@ -868,39 +881,167 @@ async function prepareSpeech(text: string): Promise<HTMLAudioElement | null> {
   }
 }
 
-// ---- Web Speech API (mic input) typings ----
+// ---- Mic input: record audio and transcribe it via Gemini ----
+//
+// We used to rely on the browser's built-in SpeechRecognition
+// (webkitSpeechRecognition). That API doesn't do recognition locally — it
+// streams audio to Google's servers, authorized using API keys baked into
+// official Chrome builds. Electron ships plain, unbranded Chromium without
+// those keys, so SpeechRecognition reliably fails there with a generic
+// `error: "network"`, regardless of the user's actual connection or mic.
+// This isn't fixable by retrying; browser-native speech recognition just
+// doesn't work in Electron. Instead we record raw audio ourselves with
+// MediaRecorder and send it to Gemini (which accepts audio input directly)
+// for transcription, using the same API key already used for chat/TTS.
+// This works identically in the browser build and the Electron desktop app.
 
-interface SpeechRecognitionResultLike {
-  transcript: string;
-}
-interface SpeechRecognitionResultListLike {
-  length: number;
-  [index: number]: { isFinal: boolean; 0: SpeechRecognitionResultLike };
-}
-interface SpeechRecognitionEventLike extends Event {
-  resultIndex: number;
-  results: SpeechRecognitionResultListLike;
-}
-interface SpeechRecognitionLike extends EventTarget {
-  lang: string;
-  interimResults: boolean;
-  continuous: boolean;
-  start: () => void;
-  stop: () => void;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onerror: ((event: Event) => void) | null;
-  onend: (() => void) | null;
-  onstart: (() => void) | null;
+function micInputSupported(): boolean {
+  return Boolean(
+    typeof navigator !== "undefined" &&
+    navigator.mediaDevices &&
+    typeof navigator.mediaDevices.getUserMedia === "function" &&
+    typeof MediaRecorder !== "undefined",
+  );
 }
 
-function getSpeechRecognition(): SpeechRecognitionLike | null {
-  const w = window as unknown as {
-    SpeechRecognition?: new () => SpeechRecognitionLike;
-    webkitSpeechRecognition?: new () => SpeechRecognitionLike;
-  };
-  const Impl = w.SpeechRecognition ?? w.webkitSpeechRecognition;
-  if (!Impl) return null;
-  return new Impl();
+// Records from the mic until ~1.5s of silence follows detected speech (or
+// a hard 15s cap is hit), then resolves with the recorded audio blob.
+// Returns null if mic access fails or nothing was recorded. `onStarted` is
+// called once recording begins with a `stop()` function, so callers can
+// let the user manually cut a recording short (e.g. a "stop listening"
+// button) instead of waiting for silence.
+function recordUntilSilence(
+  onStarted: (stop: () => void) => void,
+  options: { silenceMs?: number; maxMs?: number } = {},
+): Promise<Blob | null> {
+  const { silenceMs = 1500, maxMs = 15000 } = options;
+
+  return navigator.mediaDevices
+    .getUserMedia({ audio: true })
+    .then(
+      (stream) =>
+        new Promise<Blob | null>((resolve) => {
+          const mimeType = MediaRecorder.isTypeSupported(
+            "audio/webm;codecs=opus",
+          )
+            ? "audio/webm;codecs=opus"
+            : "audio/webm";
+          const recorder = new MediaRecorder(stream, { mimeType });
+          const chunks: BlobPart[] = [];
+          recorder.ondataavailable = (e) => {
+            if (e.data.size > 0) chunks.push(e.data);
+          };
+
+          const audioCtx = new AudioContext();
+          const source = audioCtx.createMediaStreamSource(stream);
+          const analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 2048;
+          source.connect(analyser);
+          const timeDomainData = new Uint8Array(analyser.frequencyBinCount);
+
+          let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+          let maxTimer: ReturnType<typeof setTimeout> | null = null;
+          let hasSpoken = false;
+          let settled = false;
+          let rafId = 0;
+
+          const cleanup = () => {
+            cancelAnimationFrame(rafId);
+            if (silenceTimer) clearTimeout(silenceTimer);
+            if (maxTimer) clearTimeout(maxTimer);
+            stream.getTracks().forEach((t) => t.stop());
+            audioCtx.close().catch(() => {});
+          };
+
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            if (recorder.state === "inactive") {
+              resolve(
+                chunks.length ? new Blob(chunks, { type: mimeType }) : null,
+              );
+              return;
+            }
+            recorder.onstop = () => {
+              resolve(
+                chunks.length ? new Blob(chunks, { type: mimeType }) : null,
+              );
+            };
+            recorder.stop();
+          };
+
+          const checkVolume = () => {
+            analyser.getByteTimeDomainData(timeDomainData);
+            let sumSquares = 0;
+            for (let i = 0; i < timeDomainData.length; i++) {
+              const v = (timeDomainData[i] - 128) / 128;
+              sumSquares += v * v;
+            }
+            const rms = Math.sqrt(sumSquares / timeDomainData.length);
+            const speaking = rms > 0.02;
+
+            if (speaking) {
+              hasSpoken = true;
+              if (silenceTimer) {
+                clearTimeout(silenceTimer);
+                silenceTimer = null;
+              }
+            } else if (hasSpoken && !silenceTimer) {
+              silenceTimer = setTimeout(finish, silenceMs);
+            }
+            rafId = requestAnimationFrame(checkVolume);
+          };
+
+          recorder.onerror = (event) => {
+            console.error("Mic recording error:", event);
+            finish();
+          };
+
+          recorder.start();
+          rafId = requestAnimationFrame(checkVolume);
+          maxTimer = setTimeout(finish, maxMs);
+          onStarted(finish);
+        }),
+    )
+    .catch((err) => {
+      console.error("Mic access failed:", err);
+      return null;
+    });
+}
+
+// Sends recorded audio to Gemini for transcription. `langHint` nudges it
+// toward the language the user picked in the UI, but Gemini will still
+// transcribe correctly if the user actually spoke a different language.
+async function transcribeAudio(
+  blob: Blob,
+  langHint: "en-US" | "sw-KE",
+): Promise<string> {
+  try {
+    const buffer = await blob.arrayBuffer();
+    const base64 = arrayBufferToBase64(buffer);
+    const mimeType = blob.type || "audio/webm";
+    const languageName = langHint === "sw-KE" ? "Swahili" : "English";
+
+    const json = await callGeminiWithFallback(FAST_MODEL_CHAIN_PREFERRED, {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: `Transcribe this audio clip exactly as spoken. The speaker is most likely speaking ${languageName}, but transcribe whatever language is actually used. Output ONLY the raw transcript text — no quotes, no commentary, no timestamps, nothing else. If the clip is silent or unintelligible, output nothing.`,
+            },
+            { inlineData: { mimeType, data: base64 } },
+          ],
+        },
+      ],
+    });
+    if (!json) return "";
+    return extractFinalAnswer(json).trim();
+  } catch (err) {
+    console.error("Transcription request failed:", err);
+    return "";
+  }
 }
 
 type CallPhase = "idle" | "listening" | "thinking" | "coding" | "speaking";
@@ -1090,11 +1231,11 @@ function Assistant() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [listening, setListening] = useState(false);
-  const [voiceSupported] = useState(() => getSpeechRecognition() !== null);
+  const [voiceSupported] = useState(() => micInputSupported());
   const [recognitionLang, setRecognitionLang] = useState<"en-US" | "sw-KE">(
     "en-US",
   );
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const stopListeningRef = useRef<(() => void) | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const telemetry = useTelemetryFeed(listening || loading);
 
@@ -1629,62 +1770,22 @@ function Assistant() {
   }
 
   // Listens once, resolves with the transcript (or "" if nothing usable came through).
-  function listenOnce(): Promise<string> {
-    return new Promise((resolve) => {
-      const recognition = getSpeechRecognition();
-      if (!recognition) {
-        resolve("");
-        return;
-      }
-      recognition.lang = recognitionLang;
-      recognition.interimResults = true;
-      recognition.continuous = true;
-
-      let finalTranscript = "";
-      let silenceTimer: ReturnType<typeof setTimeout> | null = null;
-      let settled = false;
-
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        recognition.stop();
-        resolve(finalTranscript.trim());
-      };
-
-      recognition.onresult = (event) => {
-        let interim = "";
-        // Only walk results from resultIndex onward — event.results
-        // accumulates every segment since start(), so re-scanning from 0
-        // on each callback re-appended already-finalized text and
-        // duplicated it in finalTranscript.
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const result = event.results[i];
-          const transcript = result[0].transcript;
-          if (result.isFinal) {
-            finalTranscript += transcript + " ";
-          } else {
-            interim += transcript;
-          }
-        }
-        if (interim) console.log("Interim:", interim);
-        if (finalTranscript) console.log("Final so far:", finalTranscript);
-        if (silenceTimer) clearTimeout(silenceTimer);
-        silenceTimer = setTimeout(finish, 1500);
-      };
-      recognition.onerror = (event) => {
-        console.error("Speech recognition error:", event);
-        setListening(false);
-        finish();
-      };
-      recognition.onend = () => {
-        setListening(false);
-        finish();
-      };
-
-      recognitionRef.current = recognition;
-      setListening(true);
-      recognition.start();
-    });
+  async function listenOnce(): Promise<string> {
+    if (!micInputSupported()) return "";
+    setListening(true);
+    try {
+      const blob = await recordUntilSilence((stop) => {
+        stopListeningRef.current = stop;
+      });
+      if (!blob) return "";
+      return await transcribeAudio(blob, recognitionLang);
+    } catch (err) {
+      console.error("Listening failed:", err);
+      return "";
+    } finally {
+      stopListeningRef.current = null;
+      setListening(false);
+    }
   }
 
   // One turn of the live call: listen, then send whatever was heard.
@@ -1714,13 +1815,13 @@ function Assistant() {
   function endCall() {
     setCallActive(false);
     callActiveRef.current = false;
-    recognitionRef.current?.stop();
+    stopListeningRef.current?.();
     setPhase("idle");
   }
 
   function toggleListening() {
     if (listening) {
-      recognitionRef.current?.stop();
+      stopListeningRef.current?.();
       return;
     }
     listenOnce().then(async (transcript) => {
