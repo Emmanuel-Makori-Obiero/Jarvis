@@ -104,11 +104,6 @@ function createTeacherWindow() {
   } else {
     teacherWindow.loadFile(path.join(__dirname, '..', 'dist', 'teacher.html'));
   }
-
-  // This window has no visible chrome to right-click on, so open devtools
-  // unconditionally (not just in dev) — otherwise asset/render errors here
-  // fail completely silently and just show as "nothing appeared".
-  teacherWindow.webContents.openDevTools({ mode: 'detach' });
 }
 
 app.whenReady().then(() => {
@@ -151,6 +146,7 @@ app.whenReady().then(() => {
   // need to tell it to start a call, not show or focus it, so the user
   // only ever sees/hears the floating character, not the app window.
   ipcMain.on('teacher:start-call', () => {
+    console.log('[Jarvis main] teacher:start-call received, mainWindow =', Boolean(mainWindow));
     mainWindow?.webContents.send('teacher:start-call');
   });
 

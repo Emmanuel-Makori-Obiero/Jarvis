@@ -274,11 +274,27 @@ export default function TeacherOverlay() {
 
       {/* Small, always-available "start a live call" button — separate
           from the avatar itself so it doesn't get swallowed by drag
-          handling. Only enables mouse events over its own tiny rect. */}
+          handling. Only enables mouse events over its own tiny rect.
+          stopPropagation on every pointer event here so the outer
+          window-drag handler (bound on the wrapper div below) never
+          treats a click on this button as the start of a drag. */}
       <button
         onPointerEnter={() => setButtonHovering(true)}
         onPointerLeave={() => setButtonHovering(false)}
-        onClick={() => getTeacherBridge().requestStartCall?.()}
+        onPointerDown={(e) => e.stopPropagation()}
+        onPointerMove={(e) => e.stopPropagation()}
+        onPointerUp={(e) => e.stopPropagation()}
+        onClick={() => {
+          console.log("[Jarvis teacher overlay] Talk to me clicked");
+          const bridge = getTeacherBridge();
+          if (!bridge.requestStartCall) {
+            console.error(
+              "[Jarvis teacher overlay] window.electronAPI.requestStartCall is missing — preload.cjs likely wasn't reloaded. Fully restart the Electron app (not just the Vite dev server) after editing main.cjs/preload.cjs.",
+            );
+            return;
+          }
+          bridge.requestStartCall();
+        }}
         style={{
           position: "absolute",
           bottom: 4,

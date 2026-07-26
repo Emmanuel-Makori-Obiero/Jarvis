@@ -138,6 +138,7 @@ const MEMORY_STORAGE_KEY = "jarvis_memory";
 const TASKS_STORAGE_KEY = "jarvis_tasks";
 const RESEARCH_STORAGE_KEY = "jarvis_research_briefs";
 const TEACHER_MODE_STORAGE_KEY = "jarvis_teacher_mode";
+const SAVED_APPS_STORAGE_KEY = "jarvis_saved_apps";
 
 // Keep this many of the most recent messages verbatim in every API call;
 // anything older than that gets folded into a running summary instead of
@@ -239,6 +240,35 @@ function loadMemory(): string[] {
   }
 }
 
+// An app built with build_app, persisted so it survives reloads/restarts
+// rather than living only in a Blob URL for the current session. edit_app
+// and delete_app both operate on this same list.
+interface SavedApp {
+  id: string;
+  title: string;
+  html: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+function loadSavedApps(): SavedApp[] {
+  try {
+    const raw = localStorage.getItem(SAVED_APPS_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveSavedApps(apps: SavedApp[]) {
+  try {
+    localStorage.setItem(SAVED_APPS_STORAGE_KEY, JSON.stringify(apps));
+  } catch (err) {
+    console.error("Failed to save the apps list:", err);
+  }
+}
+
 function makeId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
@@ -263,14 +293,16 @@ function buildSystemInstruction(
     "You are given the FULL conversation history on every turn, including everything said earlier in this call or chat. Actually use it: remember names, numbers, decisions, and anything the user told you earlier in this same session, and refer back to them naturally when relevant. Never ask the user to repeat something they already told you earlier in this conversation — check the history first.",
     "When walking someone through a multi-step task (like programming or debugging), give ONE step at a time, keep it short, then explicitly ask something like 'let me know once you've done that' before moving to the next step. Never dump several steps at once during a live call.",
     "",
-    "You have fourteen tools you can call:",
+    "You have sixteen tools you can call:",
     '1. manage_tasks(action: "add"|"list"|"complete"|"delete", title?: string, task_id?: string) — reads/writes the user\'s task list.',
     "2. research_idea(idea: string) — runs a real web search on a business idea, opens the top source in a new browser tab, and returns a short brief with citations.",
     "3. remember(fact: string) — saves a short, durable fact about the user (their name, preferences, ongoing projects, recurring context) so you can recall it in future conversations, even new ones. Call this whenever the user shares something worth remembering long-term. Do not call it for one-off details that only matter for this exchange.",
     "4. open_link(url: string, title?: string) — opens a specific URL right inside the app's own Browser panel (not a new browser tab). Use this whenever the user asks you to open a link, a website, or a page they name or that came up earlier in the conversation, including 'tell me about this site' style requests where opening it helps.",
     "5. close_link(target?: string) — closes a tab in the app's Browser panel that was previously opened with open_link. If the user just says 'close it', 'close that', or 'close the tab', call this with no target and it closes the most recently opened one. If the user names which site (e.g. 'close the Wikipedia one'), pass that name or word as target so the right tab closes even if more than one is open.",
     "6. write_code(code: string, language?: string, filename?: string) — puts code into the on-screen code editor panel instead of speaking it. Use this whenever the user asks you to write, generate, debug, fix, or add a feature to code, or when they paste code and ask for changes. Always return the FULL updated code in the code argument, not just a snippet or diff.",
-    '7. build_app(html: string, title?: string) — use this whenever the user asks you to build them an app, a website, a tool, or anything they want to actually see running and interact with (not just a code snippet). The html argument must be ONE complete, self-contained HTML document starting with <!DOCTYPE html>, with all JS in a <script> tag inline — no build step, no import statements, no external files EXCEPT you may add exactly one <script src="https://cdn.tailwindcss.com"></script> in the <head> and then style everything with Tailwind utility classes instead of hand-written CSS, since that CDN script needs no build step and runs entirely in the browser. If you use it, do not also write a separate <style> block for the same elements — pick Tailwind classes or plain CSS in <style>, not a mix for the same component. Whichever you use, make it look genuinely designed: a real color palette (not just default black-on-white), deliberate spacing and type hierarchy, and rounded/shadowed cards or buttons where they fit the app — avoid the bare, unstyled look of a first draft. Keep it fully working with no placeholders. This opens a live preview and a link the user can open in a new tab.',
+    '7. build_app(html: string, title?: string) — use this whenever the user asks you to build them an app, a website, a tool, or anything they want to actually see running and interact with (not just a code snippet). This ALWAYS creates a NEW saved app (never overwrites an existing one — use edit_app to change one that already exists) and it is saved persistently, so it is still there next time, even after restarting. The html argument must be ONE complete, self-contained HTML document starting with <!DOCTYPE html>, with all JS in a <script> tag inline — no build step, no import statements, no external files EXCEPT you may add exactly one <script src="https://cdn.tailwindcss.com"></script> in the <head> and then style everything with Tailwind utility classes instead of hand-written CSS, since that CDN script needs no build step and runs entirely in the browser. If you use it, do not also write a separate <style> block for the same elements — pick Tailwind classes or plain CSS in <style>, not a mix for the same component. Whichever you use, make it look genuinely designed: a real color palette (not just default black-on-white), deliberate spacing and type hierarchy, and rounded/shadowed cards or buttons where they fit the app — avoid the bare, unstyled look of a first draft. Keep it fully working with no placeholders. This opens a live preview and a link the user can open in a new tab.',
+    '7b. edit_app(target: string, html: string) — edits an app you already built and saved: adding data/items to it, removing them, fixing bugs, changing its design, whatever the user asks. target is the app\'s name as the user refers to it (e.g. "the todo app") — match loosely, the way open_app matches native apps. ALWAYS return the FULL updated HTML document in html, not a diff or a snippet, since this completely replaces the saved app\'s contents and is saved over the old version.',
+    '7c. delete_app(target: string) — permanently removes a saved app the user built earlier with build_app, e.g. "delete the todo app" or "get rid of that app". If it\'s currently open in the App preview, the preview closes too.',
     "8. make_file(content: string, filename?: string) — use this whenever the user asks you to write something they clearly want as a downloadable file rather than a spoken reply or code to run: a document, a report, a letter, notes, a CSV, a list, a plain text or markdown file, etc. Give the filename a sensible extension (e.g. notes.md, data.csv, letter.txt) so it downloads as the right file type. Always return the FULL file content, not a partial draft. This opens a panel with a download link and a copy button.",
     '9. open_panel(panel: "history"|"code"|"app"|"files"|"browser"|"settings") — opens one of the app\'s own side panels hands-free: "history" (chat history + memory + teacher mode toggle), "code" (code editor), "app" (app preview), "files" (downloadable file output), "browser" (the in-app web browser tabs), "settings" (the list of native apps you\'re allowed to open/close). Use this whenever the user says things like "open the history tab", "show me the code panel", "open the app preview", "show my files", "open the browser panel", "show me which apps you can control", etc. This is for the app\'s own UI panels, NOT for external websites (use open_link) and NOT for native desktop apps (use open_app).',
     '10. close_panel(panel?: "history"|"code"|"app"|"files"|"browser"|"settings") — closes one of the app\'s own side panels. If the user just says "close this panel" or "close it" without naming one, call this with no panel argument and it closes whatever is currently open. If they name a specific panel, pass it so the right one closes.',
@@ -292,6 +324,10 @@ function buildSystemInstruction(
     '{"tool_call": {"name": "write_code", "arguments": {"code": "...", "language": "...", "filename": "..."}}}',
     "or",
     '{"tool_call": {"name": "build_app", "arguments": {"html": "<!DOCTYPE html>...", "title": "..."}}}',
+    "or",
+    '{"tool_call": {"name": "edit_app", "arguments": {"target": "todo app", "html": "<!DOCTYPE html>..."}}}',
+    "or",
+    '{"tool_call": {"name": "delete_app", "arguments": {"target": "todo app"}}}',
     "or",
     '{"tool_call": {"name": "make_file", "arguments": {"content": "...", "filename": "notes.md"}}}',
     "or",
@@ -455,7 +491,9 @@ interface ToolCall {
     | "open_app"
     | "close_app"
     | "read_vscode"
-    | "edit_vscode";
+    | "edit_vscode"
+    | "edit_app"
+    | "delete_app";
   arguments: Record<string, unknown>;
 }
 
@@ -1222,6 +1260,11 @@ function Assistant() {
     url: string;
   }>({ html: "", title: "", url: "" });
   const [showAppPreview, setShowAppPreview] = useState(false);
+  // The active app's id in savedApps, so edit_app/delete_app know which
+  // saved entry the currently-open preview corresponds to. null means the
+  // preview isn't (or isn't yet) backed by a saved entry.
+  const [activeAppId, setActiveAppId] = useState<string | null>(null);
+  const [savedApps, setSavedApps] = useState<SavedApp[]>(() => loadSavedApps());
   const [showFileOutput, setShowFileOutput] = useState(false);
   const [fileOutput, setFileOutput] = useState<{
     content: string;
@@ -1291,6 +1334,7 @@ function Assistant() {
   // start one, same as clicking the in-app call button would.
   useEffect(() => {
     const unsubscribe = window.electronAPI?.onStartCallRequested?.(() => {
+      console.log("[Jarvis main window] teacher:start-call received, callActive =", callActiveRef.current);
       if (!callActiveRef.current) startCall();
     });
     return () => unsubscribe?.();
@@ -1560,6 +1604,28 @@ function Assistant() {
     );
   }
 
+  // Matches edit_app/delete_app's target string against saved apps by
+  // title (falling back to id, in case the model ever echoes one back).
+  // Same "exact, then contains" strategy as findAllowedApp above.
+  function findSavedApp(target: string): SavedApp | null {
+    const needle = target.trim().toLowerCase();
+    if (!needle) return null;
+    const byId = savedApps.find((a) => a.id === target);
+    if (byId) return byId;
+    const exact = savedApps.find((a) => a.title.toLowerCase() === needle);
+    if (exact) return exact;
+    return savedApps.find((a) => a.title.toLowerCase().includes(needle)) ?? null;
+  }
+
+  function openSavedApp(app: SavedApp) {
+    setAppPreview((prev) => {
+      if (prev.url) URL.revokeObjectURL(prev.url);
+      const blob = new Blob([app.html], { type: "text/html" });
+      return { html: app.html, title: app.title, url: URL.createObjectURL(blob) };
+    });
+    setActiveAppId(app.id);
+  }
+
   async function openAppInApp(args: Record<string, unknown>): Promise<string> {
     const { name } = args;
     if (!name || !String(name).trim()) return "No app name given to open.";
@@ -1711,16 +1777,12 @@ function Assistant() {
         toolResultText = closeLinkInApp(toolCall.arguments);
       } else if (toolCall.name === "open_app") {
         toolResultText = await openAppInApp(toolCall.arguments);
-        window.electronAPI?.announceToTeacher?.(toolResultText);
       } else if (toolCall.name === "close_app") {
         toolResultText = await closeAppInApp(toolCall.arguments);
-        window.electronAPI?.announceToTeacher?.(toolResultText);
       } else if (toolCall.name === "read_vscode") {
         toolResultText = await readVscodeInApp();
-        window.electronAPI?.announceToTeacher?.("Looking at your code in VS Code…");
       } else if (toolCall.name === "edit_vscode") {
         toolResultText = await editVscodeInApp(toolCall.arguments);
-        window.electronAPI?.announceToTeacher?.(toolResultText);
       } else if (toolCall.name === "write_code") {
         setPhase("coding");
         const { code, language, filename } = toolCall.arguments;
@@ -1736,25 +1798,72 @@ function Assistant() {
         setPhase("coding");
         const { html, title } = toolCall.arguments;
         const htmlStr = String(html ?? "");
+        const titleStr = title ? String(title) : "Untitled app";
+        const now = Date.now();
+        const newApp: SavedApp = {
+          id: makeId(),
+          title: titleStr,
+          html: htmlStr,
+          createdAt: now,
+          updatedAt: now,
+        };
+        setSavedApps((prev) => {
+          const next = [...prev, newApp];
+          saveSavedApps(next);
+          return next;
+        });
         // Keep the blob URL ready for the App tab, but don't switch to it —
         // the code editor is what should be visible while this is happening.
-        setAppPreview((prev) => {
-          if (prev.url) URL.revokeObjectURL(prev.url);
-          const blob = new Blob([htmlStr], { type: "text/html" });
-          return {
-            html: htmlStr,
-            title: title ? String(title) : "",
-            url: URL.createObjectURL(blob),
-          };
-        });
-        revealCodeInEditor(htmlStr, "html", title ? String(title) : "app.html");
+        openSavedApp(newApp);
+        revealCodeInEditor(htmlStr, "html", titleStr);
         // build_app is about seeing the thing run, not reading its code —
         // switch straight to the App Preview panel. This matters most on a
         // live call, where there's no mouse click to switch tabs by hand.
         openPanelByName("app");
-        toolResultText = `Built${
-          title ? ` "${title}"` : " the app"
-        } — the preview is open now, and you can pop it into a new tab from there whenever you want.`;
+        toolResultText = `Built "${titleStr}" and saved it — you'll find it again next time too, and you can ask me to edit it or delete it whenever you want.`;
+      } else if (toolCall.name === "edit_app") {
+        const { target, html } = toolCall.arguments;
+        const htmlStr = String(html ?? "");
+        const match = target ? findSavedApp(String(target)) : savedApps[savedApps.length - 1];
+        if (!match) {
+          toolResultText = target
+            ? `I couldn't find a saved app called "${target}".`
+            : "There's no saved app to edit yet — ask me to build one first.";
+        } else if (!htmlStr) {
+          toolResultText = "No updated content given for that app.";
+        } else {
+          setPhase("coding");
+          const updated: SavedApp = { ...match, html: htmlStr, updatedAt: Date.now() };
+          setSavedApps((prev) => {
+            const next = prev.map((a) => (a.id === match.id ? updated : a));
+            saveSavedApps(next);
+            return next;
+          });
+          openSavedApp(updated);
+          revealCodeInEditor(htmlStr, "html", updated.title);
+          openPanelByName("app");
+          toolResultText = `Updated "${updated.title}" and saved the change.`;
+        }
+      } else if (toolCall.name === "delete_app") {
+        const { target } = toolCall.arguments;
+        const match = target ? findSavedApp(String(target)) : null;
+        if (!match) {
+          toolResultText = `I couldn't find a saved app called "${target ?? ""}" to delete.`;
+        } else {
+          setSavedApps((prev) => {
+            const next = prev.filter((a) => a.id !== match.id);
+            saveSavedApps(next);
+            return next;
+          });
+          if (activeAppId === match.id) {
+            setAppPreview((prev) => {
+              if (prev.url) URL.revokeObjectURL(prev.url);
+              return { html: "", title: "", url: "" };
+            });
+            setActiveAppId(null);
+          }
+          toolResultText = `Deleted "${match.title}".`;
+        }
       } else if (toolCall.name === "make_file") {
         setPhase("coding");
         const { content, filename } = toolCall.arguments;
@@ -1803,6 +1912,19 @@ function Assistant() {
       } else {
         toolResultText = await runTool(toolCall);
       }
+
+      // Whatever Jarvis just did, the floating character reflects it —
+      // this isn't limited to a few tools, every tool call above lands
+      // here, so the character is the one visibly "doing" everything the
+      // app does, not just VS Code/app actions. A couple of tools return
+      // long, verbose results (e.g. read_vscode's full file dump) that
+      // would flood a tiny caption bubble, so those get a short fixed
+      // caption instead of their raw result text.
+      const captionText =
+        toolCall.name === "read_vscode"
+          ? "Looking at your code in VS Code…"
+          : toolResultText;
+      window.electronAPI?.announceToTeacher?.(captionText);
 
       // If the model just saved a fact, pick up the fresh memory list
       // immediately so the very next reply (and future turns) reflect it.
@@ -2408,6 +2530,48 @@ function Assistant() {
                 ✕
               </button>
             </div>
+
+            {savedApps.length > 0 && (
+              <div className="border border-[#123047] bg-[#0a0f14] flex flex-col max-h-32 overflow-y-auto">
+                {savedApps
+                  .slice()
+                  .sort((a, b) => b.updatedAt - a.updatedAt)
+                  .map((app) => (
+                    <div
+                      key={app.id}
+                      className={`flex items-center justify-between px-3 py-1.5 text-[10px] border-b border-[#123047] last:border-b-0 ${
+                        activeAppId === app.id ? "text-[#3ddcff]" : "text-[#7fa6bb]"
+                      }`}
+                    >
+                      <button
+                        onClick={() => openSavedApp(app)}
+                        className="truncate text-left flex-1 hover:text-[#3ddcff]"
+                      >
+                        {app.title}
+                      </button>
+                      <button
+                        onClick={() => {
+                          setSavedApps((prev) => {
+                            const next = prev.filter((a) => a.id !== app.id);
+                            saveSavedApps(next);
+                            return next;
+                          });
+                          if (activeAppId === app.id) {
+                            setAppPreview((prev) => {
+                              if (prev.url) URL.revokeObjectURL(prev.url);
+                              return { html: "", title: "", url: "" };
+                            });
+                            setActiveAppId(null);
+                          }
+                        }}
+                        className="text-[#3d6b85] hover:text-red-400 ml-2 shrink-0"
+                      >
+                        delete
+                      </button>
+                    </div>
+                  ))}
+              </div>
+            )}
 
             <div className="border border-[#123047] bg-[#0a0f14] flex flex-col">
               <div className="flex items-center justify-between px-3 py-2 border-b border-[#123047] text-[9px] uppercase tracking-widest text-[#3d6b85]">
