@@ -1,14 +1,27 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+
+type ReleaseAsset = {
+  name: string;
+  browser_download_url: string;
+  size: number;
+};
+
+type GithubRelease = {
+  tag_name: string;
+  assets: ReleaseAsset[];
+};
 
 type Platform = {
-  id: string;
+  id: "windows" | "mac" | "android" | "ios";
   name: string;
   detail: string;
-  version: string;
-  size: string;
-  href: string;
+  fallbackHref: string;
   icon: JSX.Element;
+  matchers: RegExp[];
 };
+
+const REPO = "Emmanuel-Makori-Obiero/Jarvis";
+const RELEASES_API = `https://api.github.com/repos/${REPO}/releases/latest`;
 
 const WindowsIcon = () => (
   <svg
@@ -47,49 +60,85 @@ const platforms: Platform[] = [
     id: "windows",
     name: "Jarvis for Windows",
     detail: "Windows 10 and later, 64-bit",
-    version: "v1.0.0",
-    size: "86 MB",
-    href: "/downloads/jarvis-setup-win.exe",
+    fallbackHref: `https://github.com/${REPO}/releases/latest`,
     icon: <WindowsIcon />,
+    matchers: [/\.exe$/i, /win.*\.zip$/i],
   },
   {
     id: "mac",
     name: "Jarvis for Mac",
     detail: "macOS 12 Monterey and later, Apple silicon or Intel",
-    version: "v1.0.0",
-    size: "92 MB",
-    href: "/downloads/jarvis-mac.dmg",
+    fallbackHref: `https://github.com/${REPO}/releases/latest`,
     icon: <AppleIcon />,
+    matchers: [/\.dmg$/i, /mac.*\.zip$/i],
   },
   {
     id: "android",
     name: "Jarvis for Android",
     detail: "Android 9 and later",
-    version: "v1.0.0",
-    size: "38 MB",
-    href: "https://play.google.com/store/apps/details?id=com.jarvis.app",
+    fallbackHref:
+      "https://play.google.com/store/apps/details?id=com.jarvis.app",
     icon: <AndroidIcon />,
+    matchers: [/\.apk$/i],
   },
   {
     id: "ios",
     name: "Jarvis for iOS",
     detail: "iOS 16 and later, iPhone and iPad",
-    version: "v1.0.0",
-    size: "41 MB",
-    href: "https://apps.apple.com/app/jarvis/id0000000000",
+    fallbackHref: "https://apps.apple.com/app/jarvis/id0000000000",
     icon: <AppleIcon />,
+    matchers: [/\.ipa$/i],
   },
 ];
 
+function formatSize(bytes: number) {
+  if (!bytes) return "";
+  const mb = bytes / (1024 * 1024);
+  return `${mb.toFixed(mb >= 100 ? 0 : 1)} MB`;
+}
+
+function findAsset(assets: ReleaseAsset[], matchers: RegExp[]) {
+  return assets.find((asset) =>
+    matchers.some((pattern) => pattern.test(asset.name)),
+  );
+}
+
 export default function Download() {
+  const [release, setRelease] = useState<GithubRelease | null>(null);
+  const [loadState, setLoadState] = useState<"loading" | "ready" | "error">(
+    "loading",
+  );
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  const handleCopyLink = async (platform: Platform) => {
+  useEffect(() => {
+    let cancelled = false;
+
+    fetch(RELEASES_API, { headers: { Accept: "application/vnd.github+json" } })
+      .then((res) => {
+        if (!res.ok) throw new Error(`GitHub API responded ${res.status}`);
+        return res.json() as Promise<GithubRelease>;
+      })
+      .then((data) => {
+        if (!cancelled) {
+          setRelease(data);
+          setLoadState("ready");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setLoadState("error");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const version = release?.tag_name ?? null;
+
+  const handleCopyLink = async (id: string, href: string) => {
     try {
-      await navigator.clipboard.writeText(
-        window.location.origin + platform.href,
-      );
-      setCopiedId(platform.id);
+      await navigator.clipboard.writeText(href);
+      setCopiedId(id);
       setTimeout(() => setCopiedId(null), 1800);
     } catch {
       // clipboard unavailable, ignore
@@ -105,54 +154,84 @@ export default function Download() {
         <h1 className="text-4xl sm:text-5xl font-semibold tracking-tight mb-4">
           Download Jarvis for your device
         </h1>
-        <p className="text-neutral-400 max-w-xl mb-12">
+        <p className="text-neutral-400 max-w-xl mb-2">
           One assistant, every screen. Pick a platform below and you'll be up
           and running in a couple of minutes.
         </p>
+        <p className="text-xs font-mono text-neutral-600 mb-12">
+          {loadState === "loading" && "Checking latest release…"}
+          {loadState === "ready" && version && `Latest release ${version}`}
+          {loadState === "error" &&
+            "Could not reach GitHub, showing store and release page links"}
+        </p>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          {platforms.map((platform) => (
-            <div
-              key={platform.id}
-              className="group relative rounded-xl border border-neutral-800 bg-neutral-900/60 p-6 transition-colors hover:border-cyan-500/60"
-            >
-              <div className="flex items-start justify-between mb-6">
-                <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-neutral-800 text-neutral-200 group-hover:text-cyan-400 transition-colors">
-                  {platform.icon}
+          {platforms.map((platform) => {
+            const asset = release
+              ? findAsset(release.assets, platform.matchers)
+              : undefined;
+            const href = asset?.browser_download_url ?? platform.fallbackHref;
+            const isDirectAsset = Boolean(asset);
+            const sizeLabel = asset ? formatSize(asset.size) : null;
+
+            return (
+              <div
+                key={platform.id}
+                className="group relative rounded-xl border border-neutral-800 bg-neutral-900/60 p-6 transition-colors hover:border-cyan-500/60"
+              >
+                <div className="flex items-start justify-between mb-6">
+                  <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-neutral-800 text-neutral-200 group-hover:text-cyan-400 transition-colors">
+                    {platform.icon}
+                  </div>
+                  <span className="text-xs font-mono text-neutral-500">
+                    {isDirectAsset ? version : "—"}
+                  </span>
                 </div>
-                <span className="text-xs font-mono text-neutral-500">
-                  {platform.version}
-                </span>
-              </div>
 
-              <h2 className="text-lg font-medium mb-1">{platform.name}</h2>
-              <p className="text-sm text-neutral-400 mb-6">{platform.detail}</p>
+                <h2 className="text-lg font-medium mb-1">{platform.name}</h2>
+                <p className="text-sm text-neutral-400 mb-6">
+                  {platform.detail}
+                </p>
 
-              <div className="flex items-center gap-3">
-                <a
-                  href={platform.href}
-                  className="inline-flex items-center justify-center rounded-lg bg-cyan-500 px-4 py-2 text-sm font-medium text-neutral-950 hover:bg-cyan-400 transition-colors"
-                >
-                  Download
-                </a>
-                <span className="text-xs text-neutral-500 font-mono">
-                  {platform.size}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => handleCopyLink(platform)}
-                  className="ml-auto text-xs text-neutral-500 hover:text-neutral-200 transition-colors"
-                >
-                  {copiedId === platform.id ? "Link copied" : "Copy link"}
-                </button>
+                <div className="flex items-center gap-3">
+                  <a
+                    href={href}
+                    target={isDirectAsset ? undefined : "_blank"}
+                    rel={isDirectAsset ? undefined : "noreferrer"}
+                    className="inline-flex items-center justify-center rounded-lg bg-cyan-500 px-4 py-2 text-sm font-medium text-neutral-950 hover:bg-cyan-400 transition-colors"
+                  >
+                    {isDirectAsset
+                      ? "Download"
+                      : platform.id === "android" || platform.id === "ios"
+                        ? "Get the app"
+                        : "View releases"}
+                  </a>
+                  {sizeLabel && (
+                    <span className="text-xs text-neutral-500 font-mono">
+                      {sizeLabel}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => handleCopyLink(platform.id, href)}
+                    className="ml-auto text-xs text-neutral-500 hover:text-neutral-200 transition-colors"
+                  >
+                    {copiedId === platform.id ? "Link copied" : "Copy link"}
+                  </button>
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
 
         <p className="mt-10 text-xs text-neutral-600">
-          Looking for release notes or older versions? Check the{" "}
-          <a href="/releases" className="underline hover:text-neutral-300">
+          Looking for older versions or a changelog? Check the{" "}
+          <a
+            href={`https://github.com/${REPO}/releases`}
+            target="_blank"
+            rel="noreferrer"
+            className="underline hover:text-neutral-300"
+          >
             releases page
           </a>
           .
