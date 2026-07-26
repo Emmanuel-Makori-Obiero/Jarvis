@@ -26,4 +26,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => ipcRenderer.removeListener("teacher:speak-state", handler);
   },
   moveTeacherWindowBy: (dx, dy) => ipcRenderer.send("teacher:move-by", dx, dy),
+
+  // Used by the autonomous walk state machine to know the screen's
+  // work area and the overlay window's own current position/size.
+  getTeacherBounds: () => ipcRenderer.invoke("teacher:get-bounds"),
+
+  // Used by the autonomous walk loop to move the window to an absolute
+  // screen position each animation frame while it "walks".
+  setTeacherPosition: (x, y) => ipcRenderer.send("teacher:set-position", x, y),
 });

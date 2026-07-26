@@ -1,84 +1,75 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
-import { ContactShadows, Environment } from "@react-three/drei";
+import { ContactShadows, Environment, useGLTF, useAnimations } from "@react-three/drei";
 import * as THREE from "three";
+import { useAutonomousWalk } from "../hooks/useAutonomousWalk";
 
-// ---- This is a PLACEHOLDER avatar, not the final "realistic teacher" ----
-//
-// A truly realistic rigged human (the actual ask) needs a real 3D asset —
-// something like a Ready Player Me export (free, realistic, already rigged
-// for a humanoid skeleton) combined with Mixamo animations (free idle/talk/
-// point/wave clips that retarget to any humanoid rig). Fetching and hosting
-// those is a one-time setup step outside this sandbox (this environment's
-// network allowlist can't reach readyplayer.me or mixamo.com to download a
-// model for you). Everything below — the window, the drag handling, the
-// idle/talking animation state machine, the IPC wiring to Jarvis's voice —
-// is real and working; only the geometry is a stand-in.
-//
-// To swap in a real model once you have a `.glb` file:
-//   1. Drop it in `public/models/teacher.glb`.
-//   2. Replace <PlaceholderFigure /> below with:
-//        const { scene, animations } = useGLTF("/models/teacher.glb");
-//        const { actions } = useAnimations(animations, scene);
-//        // then actions["Idle"]?.play() / actions["Talking"]?.play()
-//        // depending on `speaking`, and <primitive object={scene} />
-//      (both useGLTF and useAnimations come from @react-three/drei)
+// Real converted Mixamo assets:
+//   teacher.glb       - full skinned mesh + skeleton
+//   teacher-idle.glb  - same skeleton, "Sad Idle" clip only (mesh stripped)
+//   teacher-walk.glb  - same skeleton, "Walking Left Turn" clip only (mesh stripped)
+// All three share the same rig, so the idle/walk clips retarget cleanly
+// onto the base mesh's skeleton via useAnimations.
+const MODEL_URL = "/models/teacher.glb";
+const IDLE_URL = "/models/teacher-idle.glb";
+const WALK_URL = "/models/teacher-walk.glb";
 
-function PlaceholderFigure({ speaking }: { speaking: boolean }) {
-  const headRef = useRef<THREE.Mesh>(null);
+function TeacherModel({ speaking, walking }: { speaking: boolean; walking: boolean }) {
   const groupRef = useRef<THREE.Group>(null);
-  const mouthRef = useRef<THREE.Mesh>(null);
+  const { scene } = useGLTF(MODEL_URL);
+  const { animations: idleAnimations } = useGLTF(IDLE_URL);
+  const { animations: walkAnimations } = useGLTF(WALK_URL);
 
+  // Clone the scene per-instance so remounts don't fight over shared state.
+  const clonedScene = useMemo(() => scene.clone(true), [scene]);
+  const clips = useMemo(
+    () => [...idleAnimations, ...walkAnimations],
+    [idleAnimations, walkAnimations],
+  );
+  const { actions } = useAnimations(clips, clonedScene);
+
+  useEffect(() => {
+    // Both clips are named "mixamo.com" (Mixamo's default export name), so
+    // disambiguate by array position instead of by clip name.
+    const idleAction = idleAnimations[0] ? actions[idleAnimations[0].name] : undefined;
+    const walkAction = walkAnimations[0] ? actions[walkAnimations[0].name] : undefined;
+    if (!idleAction || !walkAction) return;
+
+    idleAction.reset().fadeIn(0.3).play();
+    walkAction.reset().fadeIn(0.3).play();
+    idleAction.setEffectiveWeight(walking ? 0 : 1);
+    walkAction.setEffectiveWeight(walking ? 1 : 0);
+
+    return () => {
+      idleAction.fadeOut(0.2);
+      walkAction.fadeOut(0.2);
+    };
+  }, [actions, idleAnimations, walkAnimations, walking]);
+
+  // Crude talking cue layered on top of whichever body animation is
+  // playing, same idea as the old placeholder had, until real visemes exist.
   useFrame(({ clock }) => {
-    const t = clock.getElapsedTime();
-    const bobSpeed = speaking ? 6 : 1.5;
-    const bobAmount = speaking ? 0.05 : 0.08;
-
-    if (groupRef.current) {
-      groupRef.current.position.y = Math.sin(t * bobSpeed) * bobAmount;
-      groupRef.current.rotation.y = Math.sin(t * 0.6) * 0.15;
-    }
-    if (headRef.current) {
-      headRef.current.rotation.z = Math.sin(t * bobSpeed * 0.7) * 0.03;
-    }
-    if (mouthRef.current) {
-      // Crude "talking" cue until a real viseme-driven mouth exists.
-      const scale = speaking ? 0.6 + Math.abs(Math.sin(t * 14)) * 0.6 : 0.4;
-      mouthRef.current.scale.set(1, scale, 1);
+    if (!groupRef.current) return;
+    if (speaking) {
+      const t = clock.getElapsedTime();
+      groupRef.current.rotation.z = Math.sin(t * 10) * 0.01;
+    } else {
+      groupRef.current.rotation.z = 0;
     }
   });
 
   return (
-    <group ref={groupRef} position={[0, -0.6, 0]}>
-      {/* Torso */}
-      <mesh position={[0, 0.35, 0]}>
-        <capsuleGeometry args={[0.32, 0.55, 8, 16]} />
-        <meshStandardMaterial color="#3b4a6b" roughness={0.5} />
-      </mesh>
-      {/* Head */}
-      <mesh ref={headRef} position={[0, 1.05, 0]}>
-        <sphereGeometry args={[0.28, 32, 32]} />
-        <meshStandardMaterial color="#e8b98c" roughness={0.6} />
-      </mesh>
-      {/* Mouth (placeholder talking indicator) */}
-      <mesh ref={mouthRef} position={[0, 0.95, 0.26]}>
-        <boxGeometry args={[0.12, 0.05, 0.02]} />
-        <meshStandardMaterial color="#7a2f2f" />
-      </mesh>
-      {/* Arms */}
-      <mesh position={[-0.42, 0.35, 0]} rotation={[0, 0, 0.3]}>
-        <capsuleGeometry args={[0.08, 0.5, 8, 16]} />
-        <meshStandardMaterial color="#3b4a6b" roughness={0.5} />
-      </mesh>
-      <mesh position={[0.42, 0.35, 0]} rotation={[0, 0, -0.3]}>
-        <capsuleGeometry args={[0.08, 0.5, 8, 16]} />
-        <meshStandardMaterial color="#3b4a6b" roughness={0.5} />
-      </mesh>
+    <group ref={groupRef} position={[0, -0.9, 0]} scale={1.1}>
+      <primitive object={clonedScene} />
     </group>
   );
 }
 
-// Minimal typing for the two overlay-specific bridge methods, kept local so
+useGLTF.preload(MODEL_URL);
+useGLTF.preload(IDLE_URL);
+useGLTF.preload(WALK_URL);
+
+// Minimal typing for the overlay-specific bridge methods, kept local so
 // this file doesn't need to import Assistant.tsx's internal types.
 interface TeacherBridge {
   onTeacherSpeakState?: (callback: (speaking: boolean) => void) => () => void;
@@ -91,7 +82,12 @@ function getTeacherBridge(): TeacherBridge {
 
 export default function TeacherOverlay() {
   const [speaking, setSpeaking] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const dragState = useRef<{ x: number; y: number } | null>(null);
+
+  // The avatar walks on its own whenever nothing else has claimed it -
+  // not while the user is dragging it, and not while it's talking.
+  const walking = useAutonomousWalk(dragging || speaking);
 
   useEffect(() => {
     const bridge = getTeacherBridge();
@@ -101,6 +97,7 @@ export default function TeacherOverlay() {
 
   function handlePointerDown(e: React.PointerEvent) {
     dragState.current = { x: e.clientX, y: e.clientY };
+    setDragging(true);
     (e.target as Element).setPointerCapture(e.pointerId);
   }
 
@@ -108,11 +105,13 @@ export default function TeacherOverlay() {
     if (!dragState.current) return;
     const dx = e.clientX - dragState.current.x;
     const dy = e.clientY - dragState.current.y;
+    dragState.current = { x: e.clientX, y: e.clientY };
     getTeacherBridge().moveTeacherWindowBy?.(dx, dy);
   }
 
   function handlePointerUp() {
     dragState.current = null;
+    setDragging(false);
   }
 
   return (
@@ -130,7 +129,7 @@ export default function TeacherOverlay() {
         <ambientLight intensity={0.7} />
         <directionalLight position={[2, 3, 2]} intensity={1.1} />
         <Environment preset="city" />
-        <PlaceholderFigure speaking={speaking} />
+        <TeacherModel speaking={speaking} walking={walking} />
         <ContactShadows
           position={[0, -1.1, 0]}
           opacity={0.35}
